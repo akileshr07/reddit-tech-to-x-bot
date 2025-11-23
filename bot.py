@@ -4,7 +4,7 @@ import requests
 from requests_oauthlib import OAuth1
 
 REDDIT_URL = "https://www.reddit.com/r/technology/new.json?limit=100"
-USER_AGENT = "AkiRedditBot/1.0 (by u_your_reddit_username)"  # UPDATE THIS
+USER_AGENT = "AkiRedditBot/1.0 (by u/WayOk4302)"
 
 
 # -----------------------------
