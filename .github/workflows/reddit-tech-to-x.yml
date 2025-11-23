@@ -2,9 +2,11 @@ name: Reddit r/technology → X bot
 
 on:
   schedule:
+    # IST = UTC + 5:30
     # 9:00, 12:00, 15:00, 18:00, 21:00 IST
-    # IST = UTC + 5:30 → 3:30, 6:30, 9:30, 12:30, 15:30 UTC
+    # Converted to UTC: 3:30, 6:30, 9:30, 12:30, 15:30
     - cron: "30 3,6,9,12,15 * * *"
+
   workflow_dispatch: {}
 
 jobs:
@@ -12,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -21,7 +23,8 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
 
       - name: Ensure posted_ids.txt exists
         run: |
@@ -30,18 +33,20 @@ jobs:
             touch posted_ids.txt
           fi
 
-      - name: Run bot
+      - name: Run the bot
         env:
+          RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
           X_API_KEY: ${{ secrets.X_API_KEY }}
           X_API_SECRET: ${{ secrets.X_API_SECRET }}
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
           X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
         run: python bot.py
 
-      - name: Commit updated posted_ids.txt
+      - name: Commit updated posted IDs
         run: |
-          git config user.name github-actions
-          git config user.email github-actions@github.com
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
           git add posted_ids.txt
-          git commit -m "Update posted IDs" || echo "No changes to commit"
+          git commit -m "Update posted IDs" || echo "No changes"
           git push
