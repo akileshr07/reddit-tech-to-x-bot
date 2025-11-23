@@ -1,22 +1,21 @@
 services:
-  # No always-on service needed since it's a cron-only bot.
-  # Leaving services empty means you only use the cron job below.
-  # You can still add a web/worker service in the future if needed.
-  
-cronJobs:
-  - name: reddit-tech-to-x-bot
-    type: cron
+  - type: web
+    name: reddit-to-x-bot
     runtime: python
-    version: 3.12
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    region: oregon
+    plan: free
 
-    # Run at: 9am, 12pm, 3pm, 6pm, 9pm IST
-    # IST = UTC + 5:30
-    # Converted to UTC: 03:30, 06:30, 09:30, 12:30, 15:30
-    schedule: "30 3,6,9,12,15 * * *"
+    buildCommand: pip install -r requirements.txt
+
+    startCommand: gunicorn bot:app --bind 0.0.0.0:$PORT
+
+    autoDeploy: true
 
     envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+
+      # Your X/Twitter Keys → set them in Render Dashboard
       - key: X_API_KEY
         sync: false
       - key: X_API_SECRET
@@ -25,3 +24,6 @@ cronJobs:
         sync: false
       - key: X_ACCESS_SECRET
         sync: false
+
+    healthCheckPath: /
+    healthCheckTimeout: 300
