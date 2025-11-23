@@ -3,40 +3,53 @@ import time
 import requests
 from requests_oauthlib import OAuth1
 
-
-# ---------------------------------
-# CONFIG
-# ---------------------------------
-
 PUSHSHIFT_URL = "https://api.pushshift.io/reddit/search/submission/"
 SUBREDDIT = "technology"
 WINDOW_HOURS = 8
 TOP_LIMIT = 5
+POSTED_FILE = "posted_ids.txt"
 
 
-# ---------------------------------
-# Retry helper (for Pushshift & X)
-# ---------------------------------
+# -----------------------------
+# Retry helper
+# -----------------------------
 def try_request(method, url, max_tries=3, delay=3, **kwargs):
     for attempt in range(1, max_tries + 1):
         try:
             resp = method(url, timeout=20, **kwargs)
             if resp.status_code >= 500:
-                print(f"Server error {resp.status_code}. Retry {attempt}/{max_tries}...")
+                print(f"Server error {resp.status_code}, retry {attempt}/{max_tries}...")
                 time.sleep(delay)
                 continue
             resp.raise_for_status()
             return resp
         except Exception as e:
-            print(f"Request failed: {e}. Retry {attempt}/{max_tries}...")
+            print(f"Request failed: {e}, retry {attempt}/{max_tries}...")
             time.sleep(delay)
-
     raise RuntimeError("Request failed after retries.")
 
 
-# ---------------------------------
-# Fetch from Pushshift (no auth)
-# ---------------------------------
+# -----------------------------
+# Load posted IDs
+# -----------------------------
+def load_posted_ids():
+    if not os.path.exists(POSTED_FILE):
+        return set()
+    with open(POSTED_FILE, "r") as f:
+        return set(line.strip() for line in f.readlines())
+
+
+# -----------------------------
+# Save posted ID
+# -----------------------------
+def save_posted_id(post_id):
+    with open(POSTED_FILE, "a") as f:
+        f.write(post_id + "\n")
+
+
+# -----------------------------
+# Fetch posts from Pushshift
+# -----------------------------
 def fetch_top_posts(window_hours=8, limit=5):
     now = int(time.time())
     cutoff = now - window_hours * 3600
@@ -45,32 +58,29 @@ def fetch_top_posts(window_hours=8, limit=5):
         "subreddit": SUBREDDIT,
         "after": cutoff,
         "sort": "desc",
-        "sort_type": "created_utc",
-        "size": 100
+        "sort_type": "score",
+        "size": 100,
     }
 
-    print("Fetching from Pushshift...")
+    print("Fetching posts from Pushshift...")
     resp = try_request(requests.get, PUSHSHIFT_URL, params=params)
     data = resp.json()
 
-    posts_raw = data.get("data", [])
+    list_raw = data.get("data", [])
     posts = []
 
-    for p in posts_raw:
+    for p in list_raw:
         title = p.get("title", "").strip()
         url = p.get("full_link") or f"https://www.reddit.com{p.get('permalink', '')}"
 
         score = p.get("score", 0)
         comments = p.get("num_comments", 0)
-
         engagement = score + comments * 2
 
         posts.append({
             "id": p.get("id"),
             "title": title,
             "url": url,
-            "score": score,
-            "comments": comments,
             "engagement": engagement,
         })
 
@@ -78,35 +88,27 @@ def fetch_top_posts(window_hours=8, limit=5):
     return posts[:limit]
 
 
-# ---------------------------------
-# Create tweet text
-# ---------------------------------
+# -----------------------------
+# Prepare tweet text
+# -----------------------------
 def make_tweet_text(post):
-    title = post["title"]
-    url = post["url"]
-    combined = f"{title} {url}"
+    txt = f"{post['title']} {post['url']}"
+    if len(txt) <= 280:
+        return txt
 
-    if len(combined) <= 280:
-        return combined
-
-    max_title_len = 280 - len(url) - 1
-    return f"{title[:max_title_len]}… {url}"
+    max_len = 280 - len(post["url"]) - 1
+    return f"{post['title'][:max_len]}… {post['url']}"
 
 
-# ---------------------------------
-# Send tweet
-# ---------------------------------
+# -----------------------------
+# Tweet to X
+# -----------------------------
 def post_to_x(text):
-    api_key = os.environ["X_API_KEY"]
-    api_secret = os.environ["X_API_SECRET"]
-    access_token = os.environ["X_ACCESS_TOKEN"]
-    access_secret = os.environ["X_ACCESS_SECRET"]
-
     auth = OAuth1(
-        api_key,
-        api_secret,
-        access_token,
-        access_secret,
+        os.environ["X_API_KEY"],
+        os.environ["X_API_SECRET"],
+        os.environ["X_ACCESS_TOKEN"],
+        os.environ["X_ACCESS_SECRET"],
         signature_type="auth_header",
     )
 
@@ -120,29 +122,35 @@ def post_to_x(text):
     )
 
     data = resp.json()
-    tweet_id = data.get("data", {}).get("id")
-    print(f"Tweeted → https://x.com/i/web/status/{tweet_id}")
+    print("Tweeted:", f"https://x.com/i/web/status/{data['data']['id']}")
 
 
-# ---------------------------------
-# Main bot logic
-# ---------------------------------
+# -----------------------------
+# Main logic
+# -----------------------------
 def main():
-    print("Pulling top posts from r/technology (Pushshift)...")
+    posted_ids = load_posted_ids()
+    print("Already posted IDs:", posted_ids)
+
     posts = fetch_top_posts(WINDOW_HOURS, TOP_LIMIT)
 
-    if not posts:
-        print("No posts found in last 8 hours.")
+    fresh_post = None
+    for post in posts:
+        if post["id"] not in posted_ids:
+            fresh_post = post
+            break
+
+    if not fresh_post:
+        print("No fresh posts available.")
         return
 
-    best = posts[0]
-    print("Selected post:", best)
+    print("Selected new post:", fresh_post)
 
-    tweet_text = make_tweet_text(best)
-    print("Tweet:", tweet_text)
+    tweet = make_tweet_text(fresh_post)
+    print("Tweet text:", tweet)
 
-    print("Posting to X...")
-    post_to_x(tweet_text)
+    post_to_x(tweet)
+    save_posted_id(fresh_post["id"])
 
 
 if __name__ == "__main__":
