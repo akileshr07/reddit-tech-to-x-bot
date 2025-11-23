@@ -3,23 +3,26 @@ import time
 import requests
 from requests_oauthlib import OAuth1
 
-REDDIT_URL = "https://www.reddit.com/r/technology/new.json?limit=100"
-USER_AGENT = "AkiRedditBot/1.0 (by u/WayOk4302)" # UPDATE THIS
+
+# ---------------------------------
+# CONFIG
+# ---------------------------------
+
+PUSHSHIFT_URL = "https://api.pushshift.io/reddit/search/submission/"
+SUBREDDIT = "technology"
+WINDOW_HOURS = 8
+TOP_LIMIT = 5
 
 
-# -----------------------------
-# Retry helper
-# -----------------------------
+# ---------------------------------
+# Retry helper (for Pushshift & X)
+# ---------------------------------
 def try_request(method, url, max_tries=3, delay=3, **kwargs):
-    """
-    Safe request with small retry.
-    Useful for GitHub Actions where IP sometimes gets rate-limited.
-    """
     for attempt in range(1, max_tries + 1):
         try:
-            resp = method(url, timeout=15, **kwargs)
-            if resp.status_code == 429:
-                print(f"Rate limited (429). Retry {attempt}/{max_tries}...")
+            resp = method(url, timeout=20, **kwargs)
+            if resp.status_code >= 500:
+                print(f"Server error {resp.status_code}. Retry {attempt}/{max_tries}...")
                 time.sleep(delay)
                 continue
             resp.raise_for_status()
@@ -31,74 +34,68 @@ def try_request(method, url, max_tries=3, delay=3, **kwargs):
     raise RuntimeError("Request failed after retries.")
 
 
-# -----------------------------
-# Fetch + filter + rank Reddit posts
-# -----------------------------
-def fetch_top_reddit_posts(window_hours=8, limit=5):
-    resp = try_request(
-        requests.get,
-        REDDIT_URL,
-        headers={"User-Agent": USER_AGENT},
-    )
+# ---------------------------------
+# Fetch from Pushshift (no auth)
+# ---------------------------------
+def fetch_top_posts(window_hours=8, limit=5):
+    now = int(time.time())
+    cutoff = now - window_hours * 3600
+
+    params = {
+        "subreddit": SUBREDDIT,
+        "after": cutoff,
+        "sort": "desc",
+        "sort_type": "created_utc",
+        "size": 100
+    }
+
+    print("Fetching from Pushshift...")
+    resp = try_request(requests.get, PUSHSHIFT_URL, params=params)
     data = resp.json()
 
-    now = time.time()
-    cutoff = now - (window_hours * 3600)
-
+    posts_raw = data.get("data", [])
     posts = []
 
-    for child in data.get("data", {}).get("children", []):
-        d = child.get("data", {})
-        created = d.get("created_utc", 0)
+    for p in posts_raw:
+        title = p.get("title", "").strip()
+        url = p.get("full_link") or f"https://www.reddit.com{p.get('permalink', '')}"
 
-        # Only recent posts
-        if created < cutoff:
-            continue
+        score = p.get("score", 0)
+        comments = p.get("num_comments", 0)
 
-        # Skip stickied, NSFW, ads
-        if d.get("stickied") or d.get("over_18"):
-            continue
-
-        score = d.get("score", 0)
-        comments = d.get("num_comments", 0)
-
-        engagement = score + (comments * 2)
+        engagement = score + comments * 2
 
         posts.append({
-            "id": d.get("id"),
-            "title": d.get("title", "").strip(),
-            "url": "https://www.reddit.com" + d.get("permalink", ""),
+            "id": p.get("id"),
+            "title": title,
+            "url": url,
             "score": score,
             "comments": comments,
             "engagement": engagement,
         })
 
-    # Sort by engagement
-    posts.sort(key=lambda p: p["engagement"], reverse=True)
-
+    posts.sort(key=lambda x: x["engagement"], reverse=True)
     return posts[:limit]
 
 
-# -----------------------------
-# Prepare tweet text
-# -----------------------------
+# ---------------------------------
+# Create tweet text
+# ---------------------------------
 def make_tweet_text(post):
     title = post["title"]
     url = post["url"]
-
     combined = f"{title} {url}"
 
     if len(combined) <= 280:
         return combined
 
-    max_title_len = 280 - (len(url) + 1)
-    truncated = title[: max_title_len - 1] + "…"
-    return f"{truncated} {url}"
+    max_title_len = 280 - len(url) - 1
+    return f"{title[:max_title_len]}… {url}"
 
 
-# -----------------------------
-# Tweet using X API v2
-# -----------------------------
+# ---------------------------------
+# Send tweet
+# ---------------------------------
 def post_to_x(text):
     api_key = os.environ["X_API_KEY"]
     api_secret = os.environ["X_API_SECRET"]
@@ -119,40 +116,34 @@ def post_to_x(text):
         requests.post,
         url,
         json={"text": text},
-        auth=auth,
+        auth=auth
     )
 
     data = resp.json()
     tweet_id = data.get("data", {}).get("id")
-    print(f"Tweeted successfully → https://x.com/i/web/status/{tweet_id}")
+    print(f"Tweeted → https://x.com/i/web/status/{tweet_id}")
 
 
-# -----------------------------
-# Main logic
-# -----------------------------
+# ---------------------------------
+# Main bot logic
+# ---------------------------------
 def main():
-    print("Fetching r/technology posts...")
-    posts = fetch_top_reddit_posts(window_hours=8, limit=5)
+    print("Pulling top posts from r/technology (Pushshift)...")
+    posts = fetch_top_posts(WINDOW_HOURS, TOP_LIMIT)
 
     if not posts:
         print("No posts found in last 8 hours.")
         return
 
-    # Select the #1 most engaging post
     best = posts[0]
-
-    print("Selected top post:")
-    print(best)
+    print("Selected post:", best)
 
     tweet_text = make_tweet_text(best)
-    print("Tweet text:", tweet_text)
+    print("Tweet:", tweet_text)
 
     print("Posting to X...")
     post_to_x(tweet_text)
 
 
-# -----------------------------
-# Entry point
-# -----------------------------
 if __name__ == "__main__":
     main()
