@@ -1,37 +1,41 @@
 import os
 import time
 import requests
-import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
 from requests_oauthlib import OAuth1
 
 
-RSS_URL = "https://www.reddit.com/r/technology/.rss"
+SUBREDDIT = "technology"
+URL = f"https://old.reddit.com/r/{SUBREDDIT}/new/"
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; AkiBot/1.0)"}
+
 POSTED_FILE = "posted_ids.txt"
-TOP_LIMIT = 5
 WINDOW_HOURS = 8
+TOP_LIMIT = 5
 
 
 # -----------------------------------------------
-# Safe HTTP helper with retry
+# Retry helper
 # -----------------------------------------------
 def try_request(method, url, max_tries=3, delay=3, **kwargs):
     for attempt in range(1, max_tries + 1):
         try:
-            resp = method(url, timeout=15, **kwargs)
-            if resp.status_code in [429, 500, 502, 503]:
-                print(f"Retry {attempt}/{max_tries} for {resp.status_code}")
+            r = method(url, timeout=20, **kwargs)
+            if r.status_code in [429, 500, 503]:
+                print(f"Retry {attempt}/{max_tries} for {r.status_code}")
                 time.sleep(delay)
                 continue
-            resp.raise_for_status()
-            return resp
+            r.raise_for_status()
+            return r
         except Exception as e:
-            print(f"Error: {e}, retry {attempt}/{max_tries}")
+            print(f"Error: {e} retry {attempt}/{max_tries}")
             time.sleep(delay)
-    raise RuntimeError("Failed after retries.")
+
+    raise RuntimeError("Failed after retries")
 
 
 # -----------------------------------------------
-# Load posted IDs
+# Load + Save posted IDs
 # -----------------------------------------------
 def load_posted_ids():
     if not os.path.exists(POSTED_FILE):
@@ -45,77 +49,82 @@ def save_posted_id(pid):
 
 
 # -----------------------------------------------
-# Fetch RSS posts
+# Scrape old Reddit HTML
 # -----------------------------------------------
-def fetch_rss_posts():
-    print("Fetching RSS...")
-    resp = try_request(requests.get, RSS_URL, headers={"User-Agent": "Mozilla/5.0"})
-    root = ET.fromstring(resp.text)
+def scrape_old_reddit():
+    print("Scraping old Reddit HTML...")
+    resp = try_request(requests.get, URL, headers=HEADERS)
 
-    ns = {"atom": "http://www.w3.org/2005/Atom"}
-    entries = root.findall("atom:entry", ns)
+    soup = BeautifulSoup(resp.text, "lxml")
+    things = soup.find_all("div", class_="thing")
 
     posts = []
+    now = time.time()
+    cutoff = now - WINDOW_HOURS * 3600
 
-    for entry in entries:
-        title = entry.find("atom:title", ns).text
-        link = entry.find("atom:link", ns).attrib["href"]
-        updated = entry.find("atom:updated", ns).text
+    for post in things:
+        post_id = post.get("data-fullname", "")  # t3_xxxxx
 
-        post_id = link.split("/")[-3]  # reddit.com/r/subreddit/comments/ID/title
+        title_tag = post.find("a", class_="title")
+        if not title_tag:
+            continue
+
+        title = title_tag.text.strip()
+        url = title_tag.get("href")
+
+        # Fix relative URLs
+        if url.startswith("/r/"):
+            url = "https://old.reddit.com" + url
+
+        time_tag = post.find("time")
+        if not time_tag:
+            continue
+
+        created_str = time_tag.get("datetime")
+        try:
+            # Parse ISO time
+            created_ts = int(time.mktime(time.strptime(created_str, "%Y-%m-%dT%H:%M:%S+00:00")))
+        except:
+            continue
+
+        if created_ts < cutoff:
+            continue
+
+        # Score
+        score_tag = post.find("div", class_="score likes")
+        score = 0
+        if score_tag:
+            if score_tag.text == "•":
+                score = 0
+            elif "k" in score_tag.text:
+                score = int(float(score_tag.text.replace("k", "")) * 1000)
+            else:
+                try:
+                    score = int(score_tag.text)
+                except:
+                    score = 0
+
+        # Comment count
+        com_tag = post.find("a", class_="comments")
+        comments = 0
+        if com_tag:
+            try:
+                comments = int(com_tag.text.split()[0])
+            except:
+                comments = 0
+
+        engagement = score + comments * 2
 
         posts.append({
             "id": post_id,
             "title": title,
-            "url": link,
-            "updated": updated
-        })
-
-    return posts
-
-
-# -----------------------------------------------
-# Get score & comments via Reddit JSON
-# -----------------------------------------------
-def fetch_post_metrics(post_id):
-    json_url = f"https://www.reddit.com/comments/{post_id}.json"
-    resp = try_request(requests.get, json_url, headers={"User-Agent": "Mozilla/5.0"})
-    data = resp.json()
-
-    info = data[0]["data"]["children"][0]["data"]
-
-    return {
-        "score": info.get("score", 0),
-        "comments": info.get("num_comments", 0),
-        "created": info.get("created_utc", 0)
-    }
-
-
-# -----------------------------------------------
-# Rank posts by engagement
-# -----------------------------------------------
-def select_top_posts():
-    rss_posts = fetch_rss_posts()
-    now = time.time()
-    cutoff = now - WINDOW_HOURS * 3600
-
-    enriched = []
-    for p in rss_posts:
-        metrics = fetch_post_metrics(p["id"])
-        if metrics["created"] < cutoff:
-            continue
-
-        engagement = metrics["score"] + metrics["comments"] * 2
-
-        enriched.append({
-            "id": p["id"],
-            "title": p["title"],
-            "url": p["url"],
+            "url": url,
             "engagement": engagement
         })
 
-    enriched.sort(key=lambda x: x["engagement"], reverse=True)
-    return enriched[:TOP_LIMIT]
+    # Sort posts by engagement
+    posts.sort(key=lambda x: x["engagement"], reverse=True)
+    return posts[:TOP_LIMIT]
 
 
 # -----------------------------------------------
@@ -129,24 +138,26 @@ def post_to_x(text):
         os.environ["X_ACCESS_SECRET"],
         signature_type="auth_header",
     )
+
     resp = try_request(
         requests.post,
         "https://api.twitter.com/2/tweets",
         json={"text": text},
         auth=auth
     )
+
     tid = resp.json()["data"]["id"]
     print("Tweeted:", f"https://x.com/i/web/status/{tid}")
 
 
 # -----------------------------------------------
-# Tweet selection
+# Tweet text
 # -----------------------------------------------
 def make_tweet(post):
-    text = f"{post['title']} {post['url']}"
-    if len(text) <= 280:
-        return text
-    max_len = 280 - len(post['url']) - 1
+    t = f"{post['title']} {post['url']}"
+    if len(t) <= 280:
+        return t
+    max_len = 280 - len(post["url"]) - 1
     return f"{post['title'][:max_len]}… {post['url']}"
 
 
@@ -157,7 +168,7 @@ def main():
     posted = load_posted_ids()
     print("Posted IDs:", posted)
 
-    posts = select_top_posts()
+    posts = scrape_old_reddit()
 
     fresh = None
     for p in posts:
@@ -166,7 +177,7 @@ def main():
             break
 
     if not fresh:
-        print("No fresh post")
+        print("No new posts")
         return
 
     print("Selected:", fresh)
