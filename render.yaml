@@ -1,0 +1,27 @@
+services:
+  # No always-on service needed since it's a cron-only bot.
+  # Leaving services empty means you only use the cron job below.
+  # You can still add a web/worker service in the future if needed.
+  
+cronJobs:
+  - name: reddit-tech-to-x-bot
+    type: cron
+    runtime: python
+    version: 3.12
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+
+    # Run at: 9am, 12pm, 3pm, 6pm, 9pm IST
+    # IST = UTC + 5:30
+    # Converted to UTC: 03:30, 06:30, 09:30, 12:30, 15:30
+    schedule: "30 3,6,9,12,15 * * *"
+
+    envVars:
+      - key: X_API_KEY
+        sync: false
+      - key: X_API_SECRET
+        sync: false
+      - key: X_ACCESS_TOKEN
+        sync: false
+      - key: X_ACCESS_SECRET
+        sync: false
