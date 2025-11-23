@@ -1,21 +1,12 @@
 services:
   - type: web
-    name: reddit-to-x-bot
-    runtime: python
-    region: oregon
+    name: reddit-tech-to-x-bot
+    env: python
     plan: free
-
     buildCommand: pip install -r requirements.txt
-
     startCommand: gunicorn bot:app --bind 0.0.0.0:$PORT
-
     autoDeploy: true
-
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.3
-
-      # Your X/Twitter Keys → set them in Render Dashboard
       - key: X_API_KEY
         sync: false
       - key: X_API_SECRET
@@ -24,6 +15,5 @@ services:
         sync: false
       - key: X_ACCESS_SECRET
         sync: false
-
-    healthCheckPath: /
-    healthCheckTimeout: 300
+      - key: X_BEARER_TOKEN
+        sync: false
