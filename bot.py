@@ -5,11 +5,12 @@ from requests_oauthlib import OAuth1
 import time
 
 RAPID_URL = "https://reddapi.p.rapidapi.com/api/scrape/new"
+RAPID_KEY = os.environ["RAPIDAPI_KEY"].strip()
+
 HEADERS = {
-    "x-rapidapi-key": os.environ["RAPIDAPI_KEY"],
+    "x-rapidapi-key": RAPID_KEY,
     "x-rapidapi-host": "reddapi.p.rapidapi.com"
 }
-
 POSTED_FILE = "posted_ids.txt"
 WINDOW_HOURS = 8
 LIMIT = 50
