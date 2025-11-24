@@ -7,17 +7,19 @@ LOG_FILE = "logs/sessions.jsonl"
 os.makedirs("logs", exist_ok=True)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")  # string is fine
+ADMIN_ID = os.getenv("ADMIN_ID")
 
 def notify_admin(msg: str):
     if not BOT_TOKEN or not ADMIN_ID:
-        return  # fail silently if env missing
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = {"chat_id": ADMIN_ID, "text": msg}
+        return
     try:
-        requests.post(url, data=data, timeout=5)
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={"chat_id": ADMIN_ID, "text": msg},
+            timeout=5
+        )
     except Exception:
-        pass  # avoid breaking main bot
+        pass
 
 def log_session(slot_id: str, status: str, reason: str = None, meta: dict = None):
     entry = {
@@ -31,10 +33,10 @@ def log_session(slot_id: str, status: str, reason: str = None, meta: dict = None
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
-    # Alert only on fail
-    if status == "fail":
-        notify_admin(f"❌ Slot {slot_id} failed\nReason: {reason}\nMeta: {meta}")
-    else:
+    # Telegram alerts
+    if status == "success":
         notify_admin(f"✅ Slot {slot_id} succeeded")
+    else:
+        notify_admin(f"❌ Slot {slot_id} failed\nReason: {reason}\nMeta: {meta}")
 
     return entry
