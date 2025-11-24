@@ -19,27 +19,27 @@ USER_AGENT = "AkiRedditBot/1.0 (by u/WayOk4302)"
 SUBREDDITS: Dict[str, Dict[str, Any]] = {
     "developersIndia": {
         "url": "https://www.reddit.com/r/developersIndia/",
-        "post_time": "09:00",
+        "post_time": "09:00",  # IST
         "hashtags": "#TechTwitter #Programming #Coding #WebDevelopment #DeveloperLife #100DaysOfCode #Tech",
     },
     "ProgrammerHumor": {
         "url": "https://www.reddit.com/r/ProgrammerHumor/",
-        "post_time": "18:00",
+        "post_time": "18:00",  # IST
         "hashtags": "#Funny #Humor #FunnyTweets #Memes #DankMemes #Comedy #LOL",
     },
     "technology": {
         "url": "https://www.reddit.com/r/technology/",
-        "post_time": "06:00",
+        "post_time": "06:00",  # IST
         "hashtags": "#TechNews #TechnologyNews #AI #Innovation #Gadgets #Cybersecurity #TechTrends #NewTech",
     },
     "oddlysatisfying": {
         "url": "https://www.reddit.com/r/oddlysatisfying/",
-        "post_time": "12:00",
+        "post_time": "12:00",  # IST
         "hashtags": "#OddlySatisfying #ASMR #Satisfying #Relaxing #SatisfyingVideos #Relaxation #ASMRCommunity",
     },
     "IndiaCricket": {
         "url": "https://www.reddit.com/r/IndiaCricket/hot/",
-        "post_time": "15:00",
+        "post_time": "15:00",  # IST
         "hashtags": "#Cricket #IPL #WorldCup #Sports #CricketLovers #TeamIndia #CricketFever",
     },
 }
@@ -62,8 +62,8 @@ JOIN_STYLES = [
     "{body}\n{hashtags}",
 ]
 
-POSTING_START_HOUR_IST = 6
-POSTING_END_HOUR_IST = 21
+# How far from slot time we still accept a post (in minutes)
+SLOT_TOLERANCE_MINUTES = 10
 
 MEDIA_UPLOAD_URL = "https://upload.twitter.com/1.1/media/upload.json"
 TWEET_POST_URL_V2 = "https://api.twitter.com/2/tweets"
@@ -88,13 +88,19 @@ def now_ist() -> datetime:
     return now_utc() + timedelta(hours=5, minutes=30)
 
 
-def hhmm_ist() -> str:
-    return now_ist().strftime("%H:%M")
+def hhmm_ist(dt: Optional[datetime] = None) -> str:
+    if dt is None:
+        dt = now_ist()
+    return dt.strftime("%H:%M")
 
 
-def allowed_post_time() -> bool:
-    hour = now_ist().hour
-    return POSTING_START_HOUR_IST <= hour <= POSTING_END_HOUR_IST
+def minutes_since_midnight(dt: datetime) -> int:
+    return dt.hour * 60 + dt.minute
+
+
+def parse_hhmm_to_minutes(hhmm: str) -> int:
+    h_str, m_str = hhmm.split(":")
+    return int(h_str) * 60 + int(m_str)
 
 
 # =========================================
@@ -544,28 +550,54 @@ def handle_slot_for_subreddit(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         return {"subreddit": name, "status": "error", "error": str(e)}
 
 
+def find_due_subreddits(now: datetime) -> List[Tuple[str, Dict[str, Any]]]:
+    """
+    Return all (name, cfg) where current IST time is within ±SLOT_TOLERANCE_MINUTES
+    of the configured post_time.
+    """
+    now_min = minutes_since_midnight(now)
+    slot_now = hhmm_ist(now)
+    logger.info("Current IST time %s (%s minutes)", slot_now, now_min)
+
+    targets: List[Tuple[str, Dict[str, Any]]] = []
+
+    for name, cfg in SUBREDDITS.items():
+        slot_str = cfg["post_time"]
+        slot_min = parse_hhmm_to_minutes(slot_str)
+        delta = abs(now_min - slot_min)
+        logger.info("Subreddit %s slot %s (%s minutes), delta=%s", name, slot_str, slot_min, delta)
+
+        if delta <= SLOT_TOLERANCE_MINUTES:
+            targets.append((name, cfg))
+
+    return targets
+
+
 def handle_awake() -> Dict[str, Any]:
     ist = now_ist()
-    slot_time = hhmm_ist()
-    logger.info("AWAKE at IST: %s (slot %s)", ist.isoformat(), slot_time)
+    logger.info("AWAKE at IST: %s", ist.isoformat())
 
-    if not allowed_post_time():
-        logger.info("Outside posting window, skipping.")
-        return {"status": "outside_window", "time_ist": ist.isoformat()}
-
-    # Find which subreddits match current HH:MM slot (EXACT match)
-    targets = [(name, cfg) for name, cfg in SUBREDDITS.items() if cfg["post_time"] == slot_time]
+    targets = find_due_subreddits(ist)
 
     if not targets:
-        logger.info("No subreddit configured for slot %s", slot_time)
-        return {"status": "no_slot", "time": slot_time}
+        logger.info("No subreddit within ±%s minutes of any slot.", SLOT_TOLERANCE_MINUTES)
+        return {
+            "status": "no_slot",
+            "time_ist": ist.isoformat(),
+            "tolerance_minutes": SLOT_TOLERANCE_MINUTES,
+        }
 
     results: List[Dict[str, Any]] = []
     for name, cfg in targets:
         res = handle_slot_for_subreddit(name, cfg)
         results.append(res)
 
-    return {"status": "done", "time": slot_time, "results": results}
+    return {
+        "status": "done",
+        "time_ist": ist.isoformat(),
+        "tolerance_minutes": SLOT_TOLERANCE_MINUTES,
+        "results": results,
+    }
 
 
 # =========================================
