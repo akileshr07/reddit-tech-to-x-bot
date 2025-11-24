@@ -10,6 +10,9 @@ import requests
 from flask import Flask, jsonify
 from requests_oauthlib import OAuth1
 
+# <-- session logger (make sure session_logger.py is in the same folder) -->
+from session_logger import log_session
+
 # =========================================
 # CONFIG
 # =========================================
@@ -353,7 +356,8 @@ def extract_image_urls(post: Dict[str, Any]) -> List[str]:
             src = img.get("source", {}) or {}
             u = src.get("url")
             if u:
-                urls.append(u)
+                # reddit escapes some chars -> normalize
+                urls.append(u.replace("&amp;", "&"))
 
     # Galleries (media_metadata)
     media_meta = post.get("media_metadata")
@@ -364,7 +368,7 @@ def extract_image_urls(post: Dict[str, Any]) -> List[str]:
             s = meta.get("s") or {}  # 's' = source
             u = s.get("u") or s.get("url")
             if u:
-                urls.append(u)
+                urls.append(u.replace("&amp;", "&"))
 
     # Dedup & cap at 4
     deduped: List[str] = []
@@ -412,9 +416,8 @@ def upload_images_to_twitter(image_urls: List[str]) -> List[str]:
         try:
             img_resp = requests.get(img_url, timeout=20)
             img_resp.raise_for_status()
-            files = {"media": img_resp.content}
-
-            resp = requests.post(MEDIA_UPLOAD_URL, files=files, auth=oauth1, timeout=30)
+            # requests.post for files expects file-tuple; keep simple: pass bytes
+            resp = requests.post(MEDIA_UPLOAD_URL, files={"media": img_resp.content}, auth=oauth1, timeout=30)
             if resp.status_code >= 300:
                 logger.warning("Media upload failed (%s): %s", resp.status_code, resp.text)
                 continue
@@ -514,8 +517,19 @@ def pick_best_post_and_tweet_text(
 
 
 def handle_slot_for_subreddit(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    posts = fetch_subreddit_posts(cfg)
+    """
+    integrated logging: logs failures at each meaningful step with reason codes
+    and success on completion.
+    """
+    slot_id = f"slot_{name}"
 
+    # Step 1: Fetch posts
+    posts = fetch_subreddit_posts(cfg)
+    if not posts:
+        log_session(slot_id, "fail", "reddit_fetch_empty", {"subreddit": name})
+        return {"subreddit": name, "status": "reddit_fetch_empty"}
+
+    # Step 2: Filter windows (primary -> fallback)
     primary = filter_posts_by_window(posts, PRIMARY_WINDOW_HOURS)
     candidates = primary
     if not candidates:
@@ -523,30 +537,46 @@ def handle_slot_for_subreddit(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         candidates = fallback
 
     if not candidates:
+        log_session(slot_id, "fail", "no_candidates", {"subreddit": name})
         return {"subreddit": name, "status": "no_candidates"}
 
+    # Step 3: Build tweet
     best_post, tweet_text = pick_best_post_and_tweet_text(candidates, cfg)
     if not best_post or not tweet_text:
+        log_session(slot_id, "fail", "no_tweetable_post", {"subreddit": name})
         return {"subreddit": name, "status": "no_tweetable_post"}
 
-    # Try to attach media if possible
+    # Step 4: Media extraction & upload
     image_urls = extract_image_urls(best_post)
     media_ids: List[str] = []
     if image_urls:
-        media_ids = upload_images_to_twitter(image_urls)
+        try:
+            media_ids = upload_images_to_twitter(image_urls)
+            if not media_ids and image_urls:
+                # media urls were found but upload failed
+                log_session(slot_id, "fail", "media_upload_partial_or_failed", {"image_urls": image_urls})
+                # proceed: tweet without media (optional) — we choose to continue without media
+        except Exception as e:
+            log_session(slot_id, "fail", "media_upload_failed", {"error": str(e)})
+            media_ids = []
 
+    # Step 5: Post tweet
     try:
         data = twitter_post_tweet(tweet_text, media_ids=media_ids or None)
         tweet_id = data.get("id")
         tweet_url = f"https://x.com/i/web/status/{tweet_id}" if tweet_id else None
+
+        log_session(slot_id, "success", None, {"post_id": best_post.get("id"), "tweet_url": tweet_url})
         return {
             "subreddit": name,
             "status": "tweeted",
             "tweet_url": tweet_url,
             "post_id": best_post.get("id"),
         }
+
     except Exception as e:
         logger.error("Failed to post tweet for %s: %s", name, e)
+        log_session(slot_id, "fail", "tweet_post_failed", {"error": str(e)})
         return {"subreddit": name, "status": "error", "error": str(e)}
 
 
@@ -581,6 +611,8 @@ def handle_awake() -> Dict[str, Any]:
 
     if not targets:
         logger.info("No subreddit within ±%s minutes of any slot.", SLOT_TOLERANCE_MINUTES)
+        # Log timing miss — useful when scheduler fired at wrong time
+        log_session("slot_timing", "fail", "no_slot_due", {"time": ist.isoformat()})
         return {
             "status": "no_slot",
             "time_ist": ist.isoformat(),
