@@ -1,12 +1,13 @@
-# bot.py — rewritten version
-# Put this file next to your session_logger.py
-# Requires: requests, requests_oauthlib, flask
-# Environment variables:
-#   X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET  -> for OAuth1 (media uploads)
-#   X_BEARER_TOKEN -> for OAuth2 text-only posting
-#   PORT (optional)
-#
-# Persisted posting history: posted_history.json (created next to this script)
+# bot.py
+"""
+Reddit -> X bot (full rewrite)
+- Robust Reddit fetch
+- Video handling with ffmpeg re-encode fallback
+- Twitter v1.1 chunked media upload (INIT/APPEND/FINALIZE/STATUS)
+- Wait for video processing before posting
+- Dedupe with posted_history.json (per-subreddit TTL)
+- Uses session_logger.log_session for audit logging
+"""
 
 import os
 import time
@@ -14,18 +15,21 @@ import random
 import logging
 import re
 import json
-from datetime import datetime, timedelta
+import tempfile
+import shutil
+import subprocess
 from pathlib import Path
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from flask import Flask, jsonify
 from requests_oauthlib import OAuth1
 
-# session logger from your repo
+# make sure session_logger.py exists in the same folder
 from session_logger import log_session
 
-# ========== CONFIG ==========
+# ========= CONFIG =========
 
 USER_AGENT = "AkiRedditBot/1.0 (by u/WayOk4302)"
 
@@ -75,26 +79,26 @@ JOIN_STYLES = [
     "{body}\n{hashtags}",
 ]
 
-# How far from slot time we still accept a post (in minutes)
 SLOT_TOLERANCE_MINUTES = 20
 
 MEDIA_UPLOAD_URL = "https://upload.twitter.com/1.1/media/upload.json"
 TWEET_POST_URL_V2 = "https://api.twitter.com/2/tweets"
 
-# posting history file (to avoid reposts)
 HISTORY_PATH = Path(__file__).parent / "posted_history.json"
-POST_HISTORY_TTL_HOURS = 48  # don't repost the same reddit post within 48 hours
+POST_HISTORY_TTL_HOURS = 48
 
-# media chunk size for Twitter chunked upload (5MB recommended)
-CHUNK_SIZE = 5 * 1024 * 1024
+CHUNK_SIZE = 5 * 1024 * 1024  # 5MB per chunk
 
-# Logging
+# ffmpeg detection
+FFMPEG_PATH = shutil.which("ffmpeg")
+
+# logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("reddit-x-bot")
 
 app = Flask(__name__)
 
-# ========== TIME HELPERS ==========
+# ========= TIME HELPERS =========
 
 
 def now_utc() -> datetime:
@@ -102,7 +106,6 @@ def now_utc() -> datetime:
 
 
 def now_ist() -> datetime:
-    # UTC + 5:30
     return now_utc() + timedelta(hours=5, minutes=30)
 
 
@@ -121,7 +124,7 @@ def parse_hhmm_to_minutes(hhmm: str) -> int:
     return int(h_str) * 60 + int(m_str)
 
 
-# ========== SMALL UTIL ==========
+# ========= HISTORY HELPERS =========
 
 
 def read_history() -> Dict[str, Any]:
@@ -142,7 +145,6 @@ def write_history(data: Dict[str, Any]) -> None:
 
 
 def clean_history() -> None:
-    """Remove old entries beyond TTL to keep file small."""
     data = read_history()
     cutoff = time.time() - POST_HISTORY_TTL_HOURS * 3600
     changed = False
@@ -173,7 +175,7 @@ def was_posted_recently(subreddit: str, reddit_id: str) -> bool:
     return False
 
 
-# ========== REDDIT FETCH (HARDENED) ==========
+# ========= REDDIT FETCH =========
 
 
 def reddit_fetch_json(url: str) -> Optional[Dict[str, Any]]:
@@ -217,7 +219,7 @@ def fetch_subreddit_posts(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     return posts
 
 
-# ========== FILTERS ==========
+# ========= FILTERS =========
 
 
 def clean_body(text: Optional[str]) -> str:
@@ -256,7 +258,7 @@ def filter_posts_by_window(posts: List[Dict[str, Any]], hours: int) -> List[Dict
     return out
 
 
-# ========== ENGAGEMENT SCORE ==========
+# ========= ENGAGEMENT SCORE =========
 
 
 def post_has_image(post: Dict[str, Any]) -> bool:
@@ -276,15 +278,12 @@ def post_has_image(post: Dict[str, Any]) -> bool:
 
 
 def post_has_reddit_video(post: Dict[str, Any]) -> bool:
-    # check secure_media.reddit_video or preview variants
     if post.get("secure_media") and isinstance(post["secure_media"], dict):
         if post["secure_media"].get("reddit_video"):
             return True
-    # sometimes in preview->reddit_video_preview
     preview = post.get("preview")
     if isinstance(preview, dict) and preview.get("reddit_video_preview"):
         return True
-    # url
     url = (post.get("url") or "").lower()
     if "v.redd.it" in url or url.endswith(".mp4"):
         return True
@@ -302,7 +301,6 @@ def score_post(p: Dict[str, Any]) -> float:
     if post_has_image(p):
         score += IMAGE_SCORE_BONUS
 
-    # small bonus for video posts
     if post_has_reddit_video(p):
         score += IMAGE_SCORE_BONUS / 2
 
@@ -316,7 +314,7 @@ def sort_posts_by_score(posts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return posts_sorted
 
 
-# ========== TWEET BUILDER ==========
+# ========= TWEET BUILDER =========
 
 
 def is_reddit_url(url: Optional[str]) -> bool:
@@ -381,7 +379,7 @@ def build_tweet(post: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[str]:
     return tweet
 
 
-# ========== MEDIA EXTRACTION ==========
+# ========= MEDIA EXTRACTION =========
 
 
 def extract_image_urls(post: Dict[str, Any]) -> List[str]:
@@ -422,7 +420,6 @@ def extract_image_urls(post: Dict[str, Any]) -> List[str]:
 
 
 def extract_reddit_video_url(post: Dict[str, Any]) -> Optional[str]:
-    # Common spots: secure_media.reddit_video.fallback_url, preview.reddit_video_preview.fallback_url, url if endswith .mp4
     if post.get("secure_media") and isinstance(post["secure_media"], dict):
         rv = post["secure_media"].get("reddit_video")
         if rv and rv.get("fallback_url"):
@@ -438,12 +435,10 @@ def extract_reddit_video_url(post: Dict[str, Any]) -> Optional[str]:
     if url and url.endswith(".mp4"):
         return url
 
-    # sometimes media metadata has variants
     media_meta = post.get("media_metadata") or {}
     for meta in media_meta.values():
         if not isinstance(meta, dict):
             continue
-        # sometimes 'p' list contains mp4 variants (rare)
         for key in ("s", "p"):
             s = meta.get(key) or {}
             u = s.get("u") or s.get("url")
@@ -453,7 +448,7 @@ def extract_reddit_video_url(post: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-# ========== TWITTER AUTH HELPERS ==========
+# ========= TWITTER AUTH =========
 
 
 def get_oauth1_client() -> Optional[OAuth1]:
@@ -465,13 +460,7 @@ def get_oauth1_client() -> Optional[OAuth1]:
     if not all([api_key, api_secret, access_token, access_secret]):
         return None
 
-    return OAuth1(
-        api_key,
-        api_secret,
-        access_token,
-        access_secret,
-        signature_type="auth_header",
-    )
+    return OAuth1(api_key, api_secret, access_token, access_secret, signature_type="auth_header")
 
 
 def get_twitter_auth(prefer_oauth1: bool = False) -> Tuple[str, Any]:
@@ -494,10 +483,10 @@ def get_twitter_auth(prefer_oauth1: bool = False) -> Tuple[str, Any]:
     raise RuntimeError("No valid Twitter credentials: set X_BEARER_TOKEN or OAuth1 keys.")
 
 
-# ========== TWITTER MEDIA UPLOAD (supports images + chunked video upload) ==========
+# ========= TWITTER MEDIA CHUNKED UPLOAD =========
 
 
-def _twitter_media_init_total_bytes(oauth1: OAuth1, total_bytes: int, media_type: str, media_category: str) -> Optional[str]:
+def _twitter_media_init(oauth1: OAuth1, total_bytes: int, media_type: str, media_category: str) -> Optional[str]:
     data = {
         "command": "INIT",
         "total_bytes": str(total_bytes),
@@ -514,7 +503,6 @@ def _twitter_media_init_total_bytes(oauth1: OAuth1, total_bytes: int, media_type
 def _twitter_media_append(oauth1: OAuth1, media_id: str, segment_index: int, chunk: bytes) -> bool:
     files = {"media": chunk}
     data = {"command": "APPEND", "media_id": str(media_id), "segment_index": str(segment_index)}
-    # requests wants files mapping; using data+files is correct
     resp = requests.post(MEDIA_UPLOAD_URL, data=data, files=files, auth=oauth1, timeout=60)
     if resp.status_code >= 300:
         logger.warning("APPEND failed %s: %s", resp.status_code, resp.text)
@@ -531,13 +519,88 @@ def _twitter_media_finalize(oauth1: OAuth1, media_id: str) -> bool:
     return True
 
 
+def _twitter_media_status(oauth1: OAuth1, media_id: str) -> Dict[str, Any]:
+    params = {"command": "STATUS", "media_id": str(media_id)}
+    resp = requests.get(MEDIA_UPLOAD_URL, params=params, auth=oauth1, timeout=30)
+    try:
+        return resp.json()
+    except Exception:
+        return {}
+
+
+def wait_for_video_processing(oauth1: OAuth1, media_id: str, timeout_sec: int = 120) -> bool:
+    start = time.time()
+    while time.time() - start < timeout_sec:
+        status = _twitter_media_status(oauth1, media_id)
+        processing = status.get("processing_info")
+        if not processing:
+            return True
+        state = processing.get("state")
+        if state == "succeeded":
+            return True
+        if state == "failed":
+            logger.error("Video processing failed: %s", status)
+            return False
+        check_after = processing.get("check_after_secs", 1)
+        time.sleep(check_after)
+    logger.error("Video processing timed out for media_id=%s", media_id)
+    return False
+
+
+def _download_url_to_tempfile(url: str, suffix: str = "") -> Optional[str]:
+    try:
+        headers = {"User-Agent": USER_AGENT}
+        r = requests.get(url, headers=headers, timeout=40, stream=True)
+        r.raise_for_status()
+        tf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        with open(tf.name, "wb") as fh:
+            for chunk in r.iter_content(1024 * 64):
+                if not chunk:
+                    break
+                fh.write(chunk)
+        return tf.name
+    except Exception as e:
+        logger.warning("Failed to download %s: %s", url, e)
+        return None
+
+
+def ffmpeg_reencode_to_mp4(in_path: str, out_path: str) -> bool:
+    if not FFMPEG_PATH:
+        logger.info("ffmpeg not available, cannot re-encode")
+        return False
+    # Re-encode to h264 baseline + aac audio, fast preset, reasonable bitrate.
+    cmd = [
+        FFMPEG_PATH,
+        "-y",
+        "-i",
+        in_path,
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "baseline",
+        "-level",
+        "3.1",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        out_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.warning("ffmpeg re-encode failed: %s", e)
+        return False
+
+
 def upload_media_to_twitter(media_urls: List[str]) -> List[str]:
-    """
-    Uploads given image/video urls to Twitter (v1.1 media/upload).
-    - If OAuth1 is missing -> returns [] (no media).
-    - Detects videos and performs chunked upload (INIT/APPEND/FINAL).
-    Returns list of media_id strings.
-    """
     oauth1 = get_oauth1_client()
     if not oauth1:
         logger.info("No OAuth1 keys present; posting without media.")
@@ -547,87 +610,177 @@ def upload_media_to_twitter(media_urls: List[str]) -> List[str]:
     for url in media_urls:
         try:
             logger.info("Downloading media %s", url)
-            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30, stream=True)
-            r.raise_for_status()
-            content_type = r.headers.get("Content-Type", "") or ""
-            # read all bytes (we need length)
-            content = r.content
-            total_bytes = len(content)
+            tmp_in = _download_url_to_tempfile(url, suffix=os.path.splitext(url)[1] if "." in url else "")
+            if not tmp_in:
+                logger.warning("Download failed for %s", url)
+                continue
 
-            # Decide media_type and category
-            if "video" in content_type or url.lower().endswith(".mp4") or total_bytes > 200 * 1024:
-                # consider as video
-                media_type = content_type or "video/mp4"
+            # determine if likely video
+            is_video = tmp_in.lower().endswith((".mp4", ".mov", ".mkv")) or True if "v.redd.it" in url else False
+            # Quick MIME sniff
+            try:
+                import mimetypes
+                mtype = mimetypes.guess_type(tmp_in)[0] or ""
+            except Exception:
+                mtype = ""
+
+            # If ext suggests video or size large, treat as video
+            total_bytes = Path(tmp_in).stat().st_size
+
+            treat_as_video = False
+            if url.lower().endswith((".mp4", ".mov")) or "v.redd.it" in url or total_bytes > 200 * 1024:
+                treat_as_video = True
+
+            if treat_as_video:
+                # Ensure mp4 and codec compatibility: re-encode into safe mp4 if ffmpeg available
+                tmp_fixed = None
+                if FFMPEG_PATH:
+                    tmp_fixed = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+                    ok = ffmpeg_reencode_to_mp4(tmp_in, tmp_fixed)
+                    if ok:
+                        os.unlink(tmp_in)
+                        tmp_in = tmp_fixed
+                    else:
+                        # reencode failed -> keep original file (may still work)
+                        if tmp_fixed and os.path.exists(tmp_fixed):
+                            try:
+                                os.unlink(tmp_fixed)
+                            except Exception:
+                                pass
+
+                # Now upload with chunked flow
+                media_type = "video/mp4"
                 media_category = "tweet_video"
-                logger.info("Uploading as video, size=%s bytes", total_bytes)
+                with open(tmp_in, "rb") as fh:
+                    content = fh.read()
+                total_bytes = len(content)
 
-                # INIT
-                mid = _twitter_media_init_total_bytes(oauth1, total_bytes, media_type, media_category)
+                mid = _twitter_media_init(oauth1, total_bytes, media_type, media_category)
                 if not mid:
-                    logger.warning("INIT failed for %s, skipping media", url)
+                    logger.warning("INIT failed for %s", url)
+                    try:
+                        os.unlink(tmp_in)
+                    except Exception:
+                        pass
                     continue
 
-                # APPEND in chunks
                 segment = 0
                 offset = 0
+                success_append = True
                 while offset < total_bytes:
                     chunk = content[offset: offset + CHUNK_SIZE]
                     ok = _twitter_media_append(oauth1, mid, segment, chunk)
                     if not ok:
-                        logger.warning("Append failed for segment %s of %s", segment, url)
+                        success_append = False
                         break
                     segment += 1
                     offset += len(chunk)
-                    # small sleep to be polite
-                    time.sleep(0.2)
+                    time.sleep(0.1)
+                if not success_append:
+                    logger.warning("Append failed for media %s", url)
+                    try:
+                        os.unlink(tmp_in)
+                    except Exception:
+                        pass
+                    continue
+
+                okf = _twitter_media_finalize(oauth1, mid)
+                if not okf:
+                    logger.warning("Finalize failed for media_id=%s", mid)
+                    try:
+                        os.unlink(tmp_in)
+                    except Exception:
+                        pass
+                    continue
+
+                # WAIT for processing
+                okp = wait_for_video_processing(oauth1, mid, timeout_sec=180)
+                if okp:
+                    media_ids.append(str(mid))
                 else:
-                    # FINALIZE
-                    okf = _twitter_media_finalize(oauth1, mid)
-                    if okf:
-                        media_ids.append(str(mid))
-                    else:
-                        logger.warning("Finalize failed for %s", url)
-                continue
+                    logger.warning("Video processing failed/timed out for %s", url)
+                    # Try re-encode (if not already re-encoded) and re-upload once
+                    if FFMPEG_PATH:
+                        # if we already re-encoded, don't loop forever
+                        tmp_try = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+                        ok2 = ffmpeg_reencode_to_mp4(tmp_in, tmp_try)
+                        if ok2:
+                            try:
+                                os.unlink(tmp_in)
+                            except Exception:
+                                pass
+                            # attempt again: re-init/upload
+                            with open(tmp_try, "rb") as fh2:
+                                c2 = fh2.read()
+                            total_bytes2 = len(c2)
+                            mid2 = _twitter_media_init(oauth1, total_bytes2, "video/mp4", "tweet_video")
+                            if mid2:
+                                seg2 = 0
+                                of2 = 0
+                                ok_append2 = True
+                                while of2 < total_bytes2:
+                                    ch = c2[of2: of2 + CHUNK_SIZE]
+                                    if not _twitter_media_append(oauth1, mid2, seg2, ch):
+                                        ok_append2 = False
+                                        break
+                                    seg2 += 1
+                                    of2 += len(ch)
+                                if ok_append2 and _twitter_media_finalize(oauth1, mid2) and wait_for_video_processing(oauth1, mid2, timeout_sec=180):
+                                    media_ids.append(str(mid2))
+                                else:
+                                    logger.warning("Re-upload after ffmpeg still failed for %s", url)
+                            try:
+                                os.unlink(tmp_try)
+                            except Exception:
+                                pass
+                    try:
+                        os.unlink(tmp_in)
+                    except Exception:
+                        pass
+                continue  # done with this media entry
 
             # else treat as image (small)
-            # requests.post with files for small images is fine
-            logger.info("Uploading image, size=%s bytes", total_bytes)
+            with open(tmp_in, "rb") as fh:
+                content = fh.read()
             resp = requests.post(MEDIA_UPLOAD_URL, files={"media": content}, auth=oauth1, timeout=30)
             if resp.status_code >= 300:
                 logger.warning("Image upload failed (%s): %s", resp.status_code, resp.text)
+                try:
+                    os.unlink(tmp_in)
+                except Exception:
+                    pass
                 continue
             data = resp.json()
             mid = data.get("media_id_string") or data.get("media_id")
             if mid:
                 media_ids.append(str(mid))
+            try:
+                os.unlink(tmp_in)
+            except Exception:
+                pass
 
         except Exception as e:
             logger.warning("Error uploading media from %s: %s", url, e)
+            continue
 
     return media_ids
 
 
-# ========== TWITTER TWEET POSTING ==========
+# ========= POST TWEET =========
 
 
 def twitter_post_tweet(text: str, media_ids: Optional[List[str]] = None) -> Dict[str, Any]:
-    """
-    Hybrid posting:
-    - If media_ids present -> prefer OAuth1 (user context).
-      If OAuth1 missing but Bearer exists, tweet without media.
-    - If no media_ids -> OAuth2 Bearer if present, else OAuth1.
-    """
     if media_ids:
         oauth1 = get_oauth1_client()
         if oauth1:
             payload: Dict[str, Any] = {"text": text, "media": {"media_ids": media_ids}}
-            resp = requests.post(TWEET_POST_URL_V2, json=payload, auth=oauth1, timeout=20)
+            resp = requests.post(TWEET_POST_URL_V2, json=payload, auth=oauth1, timeout=30)
         else:
             logger.info("No OAuth1 for media; tweeting text-only via OAuth2 fallback.")
             auth_type, auth_obj = get_twitter_auth(prefer_oauth1=False)
             headers = auth_obj if isinstance(auth_obj, dict) else {}
             payload = {"text": text}
-            resp = requests.post(TWEET_POST_URL_V2, json=payload, headers=headers, timeout=20)
+            resp = requests.post(TWEET_POST_URL_V2, json=payload, headers=headers, timeout=30)
     else:
         auth_type, auth_obj = get_twitter_auth(prefer_oauth1=False)
         payload = {"text": text}
@@ -643,13 +796,12 @@ def twitter_post_tweet(text: str, media_ids: Optional[List[str]] = None) -> Dict
     return resp.json().get("data", {})
 
 
-# ========== CORE LOGIC ==========
+# ========= CORE SLOT LOGIC =========
 
 
 def pick_best_post_and_tweet_text(posts: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     sorted_posts = sort_posts_by_score(posts)
     for p in sorted_posts:
-        # skip if posted recently
         subreddit_key = cfg.get("url", "").split("/")[-2] if "/" in cfg.get("url", "") else "unknown"
         reddit_id = p.get("id")
         if reddit_id and was_posted_recently(subreddit_key, reddit_id):
@@ -662,19 +814,13 @@ def pick_best_post_and_tweet_text(posts: List[Dict[str, Any]], cfg: Dict[str, An
 
 
 def handle_slot_for_subreddit(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    integrated logging: logs failures at each meaningful step with reason codes
-    and success on completion.
-    """
     slot_id = f"slot_{name}"
 
-    # Step 1: Fetch posts
     posts = fetch_subreddit_posts(cfg)
     if not posts:
         log_session(slot_id, "fail", "reddit_fetch_empty", {"subreddit": name})
         return {"subreddit": name, "status": "reddit_fetch_empty"}
 
-    # Step 2: Filter windows (primary -> fallback)
     primary = filter_posts_by_window(posts, PRIMARY_WINDOW_HOURS)
     candidates = primary
     if not candidates:
@@ -685,7 +831,6 @@ def handle_slot_for_subreddit(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         log_session(slot_id, "fail", "no_candidates", {"subreddit": name})
         return {"subreddit": name, "status": "no_candidates"}
 
-    # Step 3: Build tweet and pick post
     best_post, tweet_text = pick_best_post_and_tweet_text(candidates, cfg)
     if not best_post or not tweet_text:
         log_session(slot_id, "fail", "no_tweetable_post", {"subreddit": name})
@@ -693,20 +838,15 @@ def handle_slot_for_subreddit(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
 
     reddit_id = best_post.get("id")
     subreddit_key = cfg.get("url", "").split("/")[-2] if "/" in cfg.get("url", "") else name
-
-    # double-check posted history one more time (race-safety)
     if reddit_id and was_posted_recently(subreddit_key, reddit_id):
         log_session(slot_id, "fail", "already_posted_recently", {"subreddit": name, "post_id": reddit_id})
         return {"subreddit": name, "status": "already_posted_recently", "post_id": reddit_id}
 
-    # Step 4: Media extraction & upload (images + videos)
     media_urls: List[str] = []
-    # video first (prefer uploading the reddit video)
     rv = extract_reddit_video_url(best_post)
     if rv:
         media_urls.append(rv)
     else:
-        # fallback to images if any
         imgs = extract_image_urls(best_post)
         media_urls.extend(imgs)
 
@@ -715,30 +855,19 @@ def handle_slot_for_subreddit(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
         try:
             media_ids = upload_media_to_twitter(media_urls)
             if not media_ids and media_urls:
-                # media urls were found but upload failed
                 log_session(slot_id, "fail", "media_upload_partial_or_failed", {"image_urls": media_urls})
-                # proceed: tweet without media (we choose to continue without media)
         except Exception as e:
             log_session(slot_id, "fail", "media_upload_failed", {"error": str(e)})
             media_ids = []
 
-    # Step 5: Post tweet
     try:
         data = twitter_post_tweet(tweet_text, media_ids=media_ids or None)
         tweet_id = data.get("id")
         tweet_url = f"https://x.com/i/web/status/{tweet_id}" if tweet_id else None
 
-        # record posted to history to prevent duplicate reposts
         record_posted(subreddit_key, reddit_id, tweet_url)
-
         log_session(slot_id, "success", None, {"post_id": reddit_id, "tweet_url": tweet_url})
-        return {
-            "subreddit": name,
-            "status": "tweeted",
-            "tweet_url": tweet_url,
-            "post_id": reddit_id,
-        }
-
+        return {"subreddit": name, "status": "tweeted", "tweet_url": tweet_url, "post_id": reddit_id}
     except Exception as e:
         logger.error("Failed to post tweet for %s: %s", name, e)
         log_session(slot_id, "fail", "tweet_post_failed", {"error": str(e)})
@@ -757,7 +886,6 @@ def find_due_subreddits(now: datetime) -> List[Tuple[str, Dict[str, Any]]]:
         slot_min = parse_hhmm_to_minutes(slot_str)
         delta = abs(now_min - slot_min)
         logger.info("Subreddit %s slot %s (%s minutes), delta=%s", name, slot_str, slot_min, delta)
-
         if delta <= SLOT_TOLERANCE_MINUTES:
             targets.append((name, cfg))
 
@@ -765,7 +893,6 @@ def find_due_subreddits(now: datetime) -> List[Tuple[str, Dict[str, Any]]]:
 
 
 def handle_awake() -> Dict[str, Any]:
-    # cleanup old history entries occasionally
     try:
         clean_history()
     except Exception:
@@ -775,30 +902,20 @@ def handle_awake() -> Dict[str, Any]:
     logger.info("AWAKE at IST: %s", ist.isoformat())
 
     targets = find_due_subreddits(ist)
-
     if not targets:
         logger.info("No subreddit within ±%s minutes of any slot.", SLOT_TOLERANCE_MINUTES)
         log_session("slot_timing", "fail", "no_slot_due", {"time": ist.isoformat()})
-        return {
-            "status": "no_slot",
-            "time_ist": ist.isoformat(),
-            "tolerance_minutes": SLOT_TOLERANCE_MINUTES,
-        }
+        return {"status": "no_slot", "time_ist": ist.isoformat(), "tolerance_minutes": SLOT_TOLERANCE_MINUTES}
 
     results: List[Dict[str, Any]] = []
     for name, cfg in targets:
         res = handle_slot_for_subreddit(name, cfg)
         results.append(res)
 
-    return {
-        "status": "done",
-        "time_ist": ist.isoformat(),
-        "tolerance_minutes": SLOT_TOLERANCE_MINUTES,
-        "results": results,
-    }
+    return {"status": "done", "time_ist": ist.isoformat(), "tolerance_minutes": SLOT_TOLERANCE_MINUTES, "results": results}
 
 
-# ========== FLASK ENDPOINTS ==========
+# ========= FLASK =========
 
 
 @app.route("/", methods=["GET"])
