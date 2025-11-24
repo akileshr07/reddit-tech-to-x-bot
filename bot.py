@@ -38,9 +38,9 @@ SUBREDDITS: Dict[str, Dict[str, Any]] = {
         "hashtags": "#TechNews #TechnologyNews #AI #Innovation #Gadgets #Cybersecurity #TechTrends #NewTech",
     },
     "oddlysatisfying": {
-        "url": "https://www.reddit.com/r/oddlysatisfying/",
+        "url": "https://www.reddit.com/r/IndiaTech/",
         "post_time": "12:00",  # IST
-        "hashtags": "#OddlySatisfying #ASMR #Satisfying #Relaxing #SatisfyingVideos #Relaxation #ASMRCommunity",
+        "hashtags": "#TechTwitter #Programming #Coding #WebDevelopment",
     },
     "IndiaCricket": {
         "url": "https://www.reddit.com/r/IndiaCricket/hot/",
