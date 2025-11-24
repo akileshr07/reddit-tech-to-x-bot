@@ -66,7 +66,7 @@ JOIN_STYLES = [
 ]
 
 # How far from slot time we still accept a post (in minutes)
-SLOT_TOLERANCE_MINUTES = 10
+SLOT_TOLERANCE_MINUTES = 20
 
 MEDIA_UPLOAD_URL = "https://upload.twitter.com/1.1/media/upload.json"
 TWEET_POST_URL_V2 = "https://api.twitter.com/2/tweets"
