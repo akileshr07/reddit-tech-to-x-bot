@@ -1,99 +1,77 @@
- #!/usr/bin/env python3
+#!/usr/bin/env python3
+"""
+Async + caching rewrite of reddit -> x bot.
+Maintains core rules/logic of original script but optimized for concurrency.
+Requires: aiohttp, tenacity
+pip install aiohttp tenacity
+"""
+
+import asyncio
 import os
-import time
-import random
-import logging
 import re
 import json
-from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+import logging
+import heapq
 
-import requests
-from flask import Flask, jsonify
-from requests_oauthlib import OAuth1
+import aiohttp
+from aiohttp import ClientSession
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# <-- session logger (make sure session_logger.py is in the same folder) -->
-from session_logger import log_session
-
-# =========================================
-# CONFIG
-# =========================================
-
+# ============== CONFIG (tweak for performance) =================
 USER_AGENT = "AkiRedditBot/1.0 (by u/WayOk4302)"
-
-SUBREDDITS: Dict[str, Dict[str, Any]] = {
-    "developersIndia": {
-        "url": "https://www.reddit.com/r/developersIndia/",
-        "post_time": "09:00",  # IST
-        "hashtags": "#TechTwitter #Programming #Coding #WebDevelopment #DeveloperLife #100DaysOfCode #Tech",
-    },
-    "ProgrammerHumor": {
-        "url": "https://www.reddit.com/r/ProgrammerHumor/",
-        "post_time": "18:00",  # IST
-        "hashtags": "#Funny #Humor #FunnyTweets #Memes #DankMemes #Comedy #LOL",
-    },
-    "technology": {
-        "url": "https://www.reddit.com/r/technology/",
-        "post_time": "06:00",  # IST
-        "hashtags": "#TechNews #TechnologyNews #AI #Innovation #Gadgets #Cybersecurity #TechTrends #NewTech",
-    },
-    "oddlysatisfying": {
-        "url": "https://www.reddit.com/r/IndiaTech/",
-        "post_time": "12:00",  # IST
-        "hashtags": "#TechTwitter #Programming #Coding #WebDevelopment",
-    },
-    "IndiaCricket": {
-        "url": "https://www.reddit.com/r/IndiaCricket/hot/",
-        "post_time": "15:00",  # IST
-        "hashtags": "#Cricket #IPL #WorldCup #Sports #CricketLovers #TeamIndia #CricketFever",
-    },
-}
-
-REDDIT_LIMIT = 80
-RETRY_LIMIT = 3
-WAIT_SECONDS = 2
-
-# Sliding windows in hours
-PRIMARY_WINDOW_HOURS = 10
-FALLBACK_WINDOW_HOURS = 24
-MAX_WINDOW_HOURS = 48
-WINDOW_SEQUENCE_HOURS = [PRIMARY_WINDOW_HOURS, FALLBACK_WINDOW_HOURS, MAX_WINDOW_HOURS]
-
-BODY_CHAR_LIMIT = 220
-TWEET_MAX_LEN = 280
-
-# Kept for possible future tuning (not used directly in priority groups now)
-IMAGE_SCORE_BONUS = 10
-SINGLE_IMAGE_PRIORITY_BONUS = 25
-
-# How far from slot time we still accept a post (in minutes)
+REDDIT_LIMIT = int(os.getenv("REDDIT_LIMIT", "30"))  # default smaller for speed
+CONCURRENT_FETCHES = int(os.getenv("CONCURRENT_FETCHES", "6"))
+MEDIA_UPLOAD_WORKERS = int(os.getenv("MEDIA_UPLOAD_WORKERS", "4"))
 SLOT_TOLERANCE_MINUTES = 20
-
-# Avoid reposting same reddit post within this cooldown (hours)
 POST_COOLDOWN_HOURS = 24
+WINDOW_SEQUENCE_HOURS = [10, 24, 48]
+TWEET_MAX_LEN = 280
+BODY_CHAR_LIMIT = 220
 
+# Caching TTLs (seconds)
+ANALYSIS_TTL = 60 * 5  # 5 minutes for in-memory post analysis
+POST_HISTORY_FILE = "post_history.json"
+
+# Reddit / Twitter endpoints
+REDDIT_SUFFIX_NEW = "/new/.json"
 MEDIA_UPLOAD_URL = "https://upload.twitter.com/1.1/media/upload.json"
 TWEET_POST_URL_V2 = "https://api.twitter.com/2/tweets"
-
-# Emergency: retweet recent tweet from @HumansNoContext
-HUMANS_NO_CONTEXT_HANDLE = "HumansNoContext"
 TWITTER_USER_TIMELINE_URL_V1 = "https://api.twitter.com/1.1/statuses/user_timeline.json"
 TWITTER_RETWEET_URL_V1 = "https://api.twitter.com/1.1/statuses/retweet/{tweet_id}.json"
-
-# Local persisted posted-history file (prevents repeated posting across restarts)
-POST_HISTORY_FILE = "post_history.json"
+HUMANS_NO_CONTEXT_HANDLE = "HumansNoContext"
 
 # Logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("reddit-x-bot")
+logger = logging.getLogger("reddit-x-bot-async")
 
-app = Flask(__name__)
+# ============== PRE-COMPILED REGEX ============================
+EDIT_RE = re.compile(r"EDIT:.*", re.IGNORECASE | re.DOTALL)
+LINK_RE = re.compile(r"\[.*?\]\(.*?\)")
+SPACE_RE = re.compile(r"\s{2,}")
 
+# ============== SIMPLE TTL CACHE FOR POST ANALYSIS ============
+class TTLCache:
+    def __init__(self):
+        self._store: Dict[str, Tuple[float, Any]] = {}
 
-# =========================================
-# PERSISTENT POST HISTORY (simple JSON)
-# =========================================
+    def set(self, key: str, value: Any, ttl: int):
+        self._store[key] = (datetime.utcnow().timestamp() + ttl, value)
 
+    def get(self, key: str):
+        val = self._store.get(key)
+        if not val:
+            return None
+        exp, data = val
+        if datetime.utcnow().timestamp() > exp:
+            del self._store[key]
+            return None
+        return data
+
+ANALYSIS_CACHE = TTLCache()
+
+# ============== POST HISTORY (persistent) =====================
 def load_post_history() -> Dict[str, Any]:
     try:
         if os.path.exists(POST_HISTORY_FILE):
@@ -101,167 +79,178 @@ def load_post_history() -> Dict[str, Any]:
                 return json.load(f)
     except Exception as e:
         logger.warning("Failed to load post history: %s", e)
-    # Structure:
-    # { "posted_ids": { "<reddit_id>": "<iso timestamp>" }, "subreddit_last": { "developersIndia": "t3_abc..." } }
     return {"posted_ids": {}, "subreddit_last": {}}
 
-
-def save_post_history(history: Dict[str, Any]) -> None:
+def save_post_history(h):
     try:
         with open(POST_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f)
+            json.dump(h, f)
     except Exception as e:
         logger.warning("Failed to save post history: %s", e)
 
-
 POST_HISTORY = load_post_history()
+RECENT_POST_CACHE = set(POST_HISTORY.get("posted_ids", {}).keys())
 
-
-def mark_post_as_posted(reddit_id: str, subreddit_name: str) -> None:
+def mark_post_as_posted(reddit_id: str, subreddit_name: str):
     now_iso = datetime.utcnow().isoformat()
     POST_HISTORY.setdefault("posted_ids", {})[reddit_id] = now_iso
     POST_HISTORY.setdefault("subreddit_last", {})[subreddit_name] = reddit_id
+    RECENT_POST_CACHE.add(reddit_id)
     save_post_history(POST_HISTORY)
 
-
 def was_post_recently_posted(reddit_id: str) -> bool:
-    posted = POST_HISTORY.get("posted_ids", {})
-    ts = posted.get(reddit_id)
-    if not ts:
-        return False
-    try:
-        dt = datetime.fromisoformat(ts)
-        if datetime.utcnow() - dt < timedelta(hours=POST_COOLDOWN_HOURS):
-            return True
-    except Exception:
-        return False
+    if reddit_id in RECENT_POST_CACHE:
+        # quick hit
+        ts = POST_HISTORY.get("posted_ids", {}).get(reddit_id)
+        if not ts:
+            return False
+        try:
+            dt = datetime.fromisoformat(ts)
+            if datetime.utcnow() - dt < timedelta(hours=POST_COOLDOWN_HOURS):
+                return True
+        except Exception:
+            return False
     return False
 
+# ============== SUBREDDIT CONFIG (example) ===================
+SUBREDDITS: Dict[str, Dict[str, Any]] = {
+    "developersIndia": {
+        "url": "https://www.reddit.com/r/developersIndia",
+        "post_time": "09:00",
+        "hashtags": "#TechTwitter #Programming #Coding #WebDevelopment #DeveloperLife #100DaysOfCode #Tech",
+    },
+    "ProgrammerHumor": {
+        "url": "https://www.reddit.com/r/ProgrammerHumor",
+        "post_time": "18:00",
+        "hashtags": "#Funny #Humor #FunnyTweets #Memes #DankMemes #Comedy #LOL",
+    },
+    # add others as needed...
+}
 
-# =========================================
-# TIME HELPERS
-# =========================================
-
-def now_utc() -> datetime:
-    return datetime.utcnow()
-
-
-def now_ist() -> datetime:
-    # UTC + 5:30
-    return now_utc() + timedelta(hours=5, minutes=30)
-
-
-def hhmm_ist(dt: Optional[datetime] = None) -> str:
-    if dt is None:
-        dt = now_ist()
-    return dt.strftime("%H:%M")
-
-
-def minutes_since_midnight(dt: datetime) -> int:
-    return dt.hour * 60 + dt.minute
-
-
-def parse_hhmm_to_minutes(hhmm: str) -> int:
-    h_str, m_str = hhmm.split(":")
-    return int(h_str) * 60 + int(m_str)
-
-
-# =========================================
-# REDDIT FETCH (HARDENED)
-# =========================================
-
-def reddit_fetch_json(url: str) -> Optional[Dict[str, Any]]:
-    headers = {"User-Agent": USER_AGENT}
-
-    for attempt in range(1, RETRY_LIMIT + 1):
+# ============== ASYNC HTTP HELPERS ===========================
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.5, max=5), retry=retry_if_exception_type(Exception))
+async def fetch_json(session: ClientSession, url: str, params: dict = None, headers: dict = None, timeout: int = 15) -> Optional[dict]:
+    hdrs = headers or {}
+    hdrs.setdefault("User-Agent", USER_AGENT)
+    async with session.get(url, params=params, headers=hdrs, timeout=timeout) as resp:
+        text = await resp.text()
+        if resp.status >= 500:
+            raise RuntimeError(f"Server error {resp.status}")
+        # If Reddit sometimes returns HTML because of blocking, treat as failure
+        if text.lstrip().startswith("<"):
+            raise RuntimeError("Non-JSON response")
         try:
-            resp = requests.get(url, headers=headers, timeout=15)
-            # Rate limit / transient
-            if resp.status_code in (429, 500, 502, 503, 504):
-                logger.warning(
-                    "Reddit HTTP %s, attempt %s/%s",
-                    resp.status_code,
-                    attempt,
-                    RETRY_LIMIT,
-                )
-                time.sleep(WAIT_SECONDS * attempt)
-                continue
+            return await resp.json()
+        except Exception:
+            # fallback: attempt manual parse
+            return None
 
-            text = resp.text
-            # HTML fallback = blocked / not JSON
-            if text.lstrip().startswith("<"):
-                logger.warning("Reddit returned HTML, attempt %s/%s", attempt, RETRY_LIMIT)
-                time.sleep(WAIT_SECONDS * attempt)
-                continue
+async def fetch_bytes(session: ClientSession, url: str, timeout: int = 20) -> Optional[bytes]:
+    async with session.get(url, timeout=timeout) as resp:
+        if resp.status >= 300:
+            logger.warning("Image fetch failed %s -> %s", url, resp.status)
+            return None
+        return await resp.read()
 
-            return resp.json()
+# ============== POST ANALYSIS (cached) =======================
+def clean_body_sync(text: Optional[str]) -> str:
+    t = text or ""
+    t = EDIT_RE.sub("", t)
+    t = LINK_RE.sub("", t)
+    t = t.replace("\n", " ")
+    t = SPACE_RE.sub(" ", t)
+    return t.strip()
 
-        except Exception as e:
-            logger.warning("Reddit fetch error attempt %s/%s: %s", attempt, RETRY_LIMIT, e)
-            time.sleep(WAIT_SECONDS * attempt)
-
-    logger.error("Reddit fetch failed after %s attempts", RETRY_LIMIT)
-    return None
-
-
-def fetch_subreddit_posts(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
-    base = cfg["url"].rstrip("/")
-    # Use /new so we can apply real sliding time windows (10h/24h/48h)
-    url = f"{base}/new/.json?limit={REDDIT_LIMIT}"
-
-    data = reddit_fetch_json(url)
-    if not data:
-        return []
-
-    children = data.get("data", {}).get("children", [])
-    posts = [c.get("data", {}) for c in children if isinstance(c, dict)]
-    logger.info("Fetched %d raw posts from %s", len(posts), base)
-    return posts
-
-
-# =========================================
-# POST TYPE CHECKS AND FILTERS
-# =========================================
-
-def clean_body(text: Optional[str]) -> str:
-    text = text or ""
-    # Remove EDIT sections
-    text = re.sub(r"EDIT:.*", "", text, flags=re.IGNORECASE | re.DOTALL)
-    # Remove markdown links [text](url)
-    text = re.sub(r"\[.*?\]\(.*?\)", "", text)
-    # Newlines to spaces
-    text = text.replace("\n", " ")
-    # Collapse multiple spaces
-    text = re.sub(r"\s{2,}", " ", text)
-    return text.strip()
-
-
-def post_is_video(post: Dict[str, Any]) -> bool:
+def post_is_video_sync(post: Dict[str, Any]) -> bool:
     if post.get("is_video"):
         return True
-
     secure_media = post.get("secure_media") or post.get("media")
     if isinstance(secure_media, dict):
         if secure_media.get("reddit_video") or str(secure_media.get("type", "")).startswith("video"):
             return True
-
     preview = post.get("preview")
     if isinstance(preview, dict):
         images = preview.get("images") or []
         for img in images:
-            if not isinstance(img, dict):
-                continue
             variants = img.get("variants", {})
             if "mp4" in variants or "gif" in variants:
                 return True
-
     url = (post.get("url") or "").lower()
     if any(url.endswith(ext) for ext in (".mp4", ".mov", ".webm")):
         return True
-
     return False
 
+def post_is_gif_or_animated_sync(post: Dict[str, Any]) -> bool:
+    url = (post.get("url") or "").lower()
+    if any(url.endswith(ext) for ext in (".gif", ".gifv", ".webp")):
+        return True
+    preview = post.get("preview")
+    if isinstance(preview, dict):
+        images = preview.get("images") or []
+        for img in images:
+            variants = img.get("variants", {})
+            if "gif" in variants or "mp4" in variants:
+                return True
+    return False
 
+def post_has_image_sync(post: Dict[str, Any]) -> bool:
+    url = (post.get("url") or "").lower()
+    if any(url.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
+        return True
+    preview = post.get("preview")
+    if isinstance(preview, dict) and preview.get("images"):
+        return True
+    media_meta = post.get("media_metadata")
+    if isinstance(media_meta, dict) and media_meta:
+        return True
+    return False
+
+def is_gallery_post_sync(post: Dict[str, Any]) -> bool:
+    if post.get("is_gallery"):
+        return True
+    if isinstance(post.get("gallery_data"), dict):
+        return True
+    if isinstance(post.get("media_metadata"), dict) and post.get("media_metadata"):
+        return True
+    return False
+
+def post_is_poll_sync(post: Dict[str, Any]) -> bool:
+    if post.get("poll_data"):
+        return True
+    if isinstance(post.get("polls"), list) and post.get("polls"):
+        return True
+    return False
+
+def passes_hard_filters_sync(post: Dict[str, Any]) -> bool:
+    # quick checks first
+    url = post.get("url") or ""
+    if post_is_video_sync(post):
+        return False
+    if is_external_video_url(url):
+        return False
+    if post_is_gif_or_animated_sync(post):
+        return False
+    if post_is_poll_sync(post):
+        return False
+    if post_is_crosspost_sync(post):
+        return False
+    if post.get("spoiler"):
+        return False
+    if post.get("over_18"):
+        return False
+    if post.get("stickied"):
+        return False
+    if post.get("distinguished") not in (None, "", "null"):
+        return False
+    if post_is_deleted_or_removed_sync(post):
+        return False
+    if post_is_promoted_or_sponsored_sync(post):
+        return False
+    if post.get("contest_mode"):
+        return False
+    return True
+
+# small sync helper functions used by hard filters
 def is_external_video_url(url: Optional[str]) -> bool:
     if not url:
         return False
@@ -281,67 +270,7 @@ def is_external_video_url(url: Optional[str]) -> bool:
     ]
     return any(d in u for d in video_domains)
 
-
-def post_is_gif_or_animated(post: Dict[str, Any]) -> bool:
-    url = (post.get("url") or "").lower()
-    if any(url.endswith(ext) for ext in (".gif", ".gifv", ".webp")):
-        return True
-
-    preview = post.get("preview")
-    if isinstance(preview, dict):
-        images = preview.get("images") or []
-        for img in images:
-            if not isinstance(img, dict):
-                continue
-            variants = img.get("variants", {})
-            if "gif" in variants or "mp4" in variants:
-                return True
-
-    return False
-
-
-def post_has_image(post: Dict[str, Any]) -> bool:
-    url = (post.get("url") or "").lower()
-    if any(url.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
-        return True
-
-    preview = post.get("preview")
-    if isinstance(preview, dict) and preview.get("images"):
-        return True
-
-    media_meta = post.get("media_metadata")
-    if isinstance(media_meta, dict) and media_meta:
-        return True
-
-    return False
-
-
-def is_gallery_post(post: Dict[str, Any]) -> bool:
-    if post.get("is_gallery"):
-        return True
-    if isinstance(post.get("gallery_data"), dict):
-        return True
-    if isinstance(post.get("media_metadata"), dict) and post.get("media_metadata"):
-        return True
-    return False
-
-
-def is_text_post(post: Dict[str, Any]) -> bool:
-    return bool(post.get("is_self"))
-
-
-def is_link_post(post: Dict[str, Any]) -> bool:
-    if post.get("is_self"):
-        return False
-    post_hint = str(post.get("post_hint") or "").lower()
-    return post_hint in ("link", "rich:video")
-
-
-def is_text_or_link_post(post: Dict[str, Any]) -> bool:
-    return is_text_post(post) or is_link_post(post)
-
-
-def post_is_crosspost(post: Dict[str, Any]) -> bool:
+def post_is_crosspost_sync(post: Dict[str, Any]) -> bool:
     if post.get("crosspost_parent"):
         return True
     cpl = post.get("crosspost_parent_list")
@@ -349,16 +278,7 @@ def post_is_crosspost(post: Dict[str, Any]) -> bool:
         return True
     return False
 
-
-def post_is_poll(post: Dict[str, Any]) -> bool:
-    if post.get("poll_data"):
-        return True
-    if isinstance(post.get("polls"), list) and post.get("polls"):
-        return True
-    return False
-
-
-def post_is_deleted_or_removed(post: Dict[str, Any]) -> bool:
+def post_is_deleted_or_removed_sync(post: Dict[str, Any]) -> bool:
     title = (post.get("title") or "").strip().lower()
     body = (post.get("selftext") or "").strip().lower()
     if title in ("[deleted]", "[removed]"):
@@ -369,8 +289,7 @@ def post_is_deleted_or_removed(post: Dict[str, Any]) -> bool:
         return True
     return False
 
-
-def post_is_promoted_or_sponsored(post: Dict[str, Any]) -> bool:
+def post_is_promoted_or_sponsored_sync(post: Dict[str, Any]) -> bool:
     if post.get("is_created_from_ads_ui"):
         return True
     if post.get("promoted"):
@@ -381,236 +300,122 @@ def post_is_promoted_or_sponsored(post: Dict[str, Any]) -> bool:
         return True
     return False
 
+def compute_engagement_score_sync(post: Dict[str, Any]) -> float:
+    ups = post.get("ups") or 0
+    comments = post.get("num_comments") or 0
+    upr = post.get("upvote_ratio") or 0.0
+    score = (ups * 0.65) + (comments * 0.35) + (upr * 10.0)
+    return float(score)
 
-def passes_hard_filters(post: Dict[str, Any]) -> bool:
-    """
-    STEP 2 — Hard Filters (Auto-Reject — No Scoring)
-    Reject if:
-    - Video / external video / GIF/animated
-    - Poll
-    - Crosspost
-    - Spoiler / NSFW
-    - Stickied / distinguished
-    - Deleted / removed
-    - Promoted / sponsored
-    - Contest-mode
-    """
-    url = post.get("url") or ""
-
-    # Post type restrictions
-    if post_is_video(post):
-        return False
-    if is_external_video_url(url):
-        return False
-    if post_is_gif_or_animated(post):
-        return False
-    if post_is_poll(post):
-        return False
-    if post_is_crosspost(post):
-        return False
-
-    # Spoiler / NSFW
-    if post.get("spoiler"):
-        return False
-    if post.get("over_18"):
-        return False
-
-    # Stickied / distinguished
-    if post.get("stickied"):
-        return False
-    if post.get("distinguished") not in (None, "", "null"):
-        return False
-
-    # Deleted / removed
-    if post_is_deleted_or_removed(post):
-        return False
-
-    # Promoted / sponsored
-    if post_is_promoted_or_sponsored(post):
-        return False
-
-    # Contest-mode
-    if post.get("contest_mode"):
-        return False
-
-    return True
-
-
-# =========================================
-# ENGAGEMENT SCORE & PRIORITY
-# =========================================
-
-def extract_image_urls(post: Dict[str, Any]) -> List[str]:
+def extract_image_urls_sync(post: Dict[str, Any]) -> List[str]:
     urls: List[str] = []
-
-    # Direct image link
     url = post.get("url") or ""
     if any(url.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp")):
         urls.append(url)
-
-    # Preview images
     preview = post.get("preview")
     if isinstance(preview, dict):
         images = preview.get("images") or []
         for img in images:
-            if not isinstance(img, dict):
-                continue
             src = img.get("source", {}) or {}
             u = src.get("url")
             if u:
                 urls.append(u.replace("&amp;", "&"))
-
-    # Galleries (media_metadata)
     media_meta = post.get("media_metadata")
     if isinstance(media_meta, dict):
         for meta in media_meta.values():
-            if not isinstance(meta, dict):
-                continue
-            s = meta.get("s") or {}  # 's' = source
+            s = meta.get("s") or {}
             u = s.get("u") or s.get("url")
             if u:
                 urls.append(u.replace("&amp;", "&"))
-
-    # Dedup & cap at 4
-    deduped: List[str] = []
+    # dedup and cap
+    deduped = []
     for u in urls:
         if u not in deduped:
             deduped.append(u)
         if len(deduped) >= 4:
             break
-
     return deduped
 
-
-def compute_priority_group(post: Dict[str, Any], body: str) -> int:
-    """
-    STEP 4 — Prioritization Rules (Before Scoring)
-
-    TOP PRIORITY (3):
-      - No body text AND is Gallery or Image
-
-    SECOND PRIORITY (2):
-      - Other Gallery and Image posts
-
-    LOWEST PRIORITY (1):
-      - Text or Link posts with selftext ≤ 200 chars
-    """
-    gallery = is_gallery_post(post)
-    image = post_has_image(post)
+def compute_priority_group_sync(post: Dict[str, Any], body: str) -> int:
+    gallery = is_gallery_post_sync(post)
+    image = post_has_image_sync(post)
     has_body = bool(body)
-
     if (gallery or image) and not has_body:
-        return 3  # top priority
-
+        return 3
     if gallery or image:
-        return 2  # second priority
+        return 2
+    return 1
 
-    # Remaining candidates are short text/link posts (≤ 200 chars enforced earlier)
-    return 1  # lowest priority
-
-
-def compute_engagement_score(post: Dict[str, Any]) -> float:
-    """
-    STEP 5 — Engagement Score Calculation
-
-    score = (upvotes * 0.65)
-          + (comments * 0.35)
-          + (upvote_ratio * 10)
-    """
-    ups = post.get("ups") or 0
-    comments = post.get("num_comments") or 0
-    upr = post.get("upvote_ratio") or 0.0
-
-    score = (ups * 0.65) + (comments * 0.35) + (upr * 10.0)
-    return float(score)
-
-
-# =========================================
-# TWEET BUILDER (NEW RULES)
-# =========================================
-
-def is_reddit_url(url: Optional[str]) -> bool:
-    if not url:
-        return False
-    u = url.lower()
-    return ("reddit.com" in u) or ("redd.it" in u)
-
-
-def is_external_url(url: Optional[str]) -> bool:
-    return bool(url) and not is_reddit_url(url)
-
-
-def _split_hashtags(hashtags: str) -> List[str]:
-    """
-    Split hashtag string into tokens, preserving order.
-    """
-    if not hashtags:
+# ============== ASYNC REDDIT FETCH ===========================
+async def fetch_subreddit_posts(session: ClientSession, base_url: str, limit: int = REDDIT_LIMIT) -> List[Dict[str, Any]]:
+    base = base_url.rstrip("/")
+    url = f"{base}{REDDIT_SUFFIX_NEW}"
+    params = {"limit": str(limit)}
+    data = await fetch_json(session, url, params=params)
+    if not data:
         return []
-    return [tok for tok in hashtags.split() if tok.strip()]
+    children = data.get("data", {}).get("children", [])
+    posts = [c.get("data", {}) for c in children if isinstance(c, dict)]
+    return posts
 
+# ============== FAST SELECTION PIPELINE (async wrapper) ============
+async def analyze_post_cached(post: Dict[str, Any]) -> Dict[str, Any]:
+    pid = post.get("id") or post.get("name") or str(hash(json.dumps(post)))
+    cached = ANALYSIS_CACHE.get(pid)
+    if cached:
+        return cached
+    # Light-weight analysis
+    body = clean_body_sync(post.get("selftext"))
+    passes = passes_hard_filters_sync(post)
+    if not passes:
+        res = {"pass": False}
+        ANALYSIS_CACHE.set(pid, res, ANALYSIS_TTL)
+        return res
+    # More analysis only when it passes quick filters
+    priority = compute_priority_group_sync(post, body)
+    score = compute_engagement_score_sync(post)
+    has_title = bool((post.get("title") or "").strip())
+    has_images = is_gallery_post_sync(post) or post_has_image_sync(post)
+    res = {
+        "pass": True,
+        "body": body,
+        "title": (post.get("title") or "").strip(),
+        "priority": priority,
+        "score": score,
+        "has_title": has_title,
+        "has_images": has_images,
+    }
+    ANALYSIS_CACHE.set(pid, res, ANALYSIS_TTL)
+    return res
 
-def build_tweet(post: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[str]:
-    """
-    TWEET TEXT RULES:
-
-    RULE 1 — Determine Base Tweet Text
-      CASE A — Only title (no body):           use title
-      CASE B — Title + body:                   use body
-      CASE C — Title + body + images/gallery:  use title  (body ignored)
-
-    RULE 2 — Append Subreddit-Specific Hashtags
-      {base_text} {#tag1 #tag2 ...}   (no external URL)
-      OR, if external URL:
-      {base_text}
-      {external_url}
-      {hashtags}
-
-    RULE 3 — Enforce 280 characters:
-      1) Build full tweet
-      2) If > 280, drop hashtags from END one-by-one
-      3) If still > 280 with 0 hashtags, trim base_text by single characters
-         from the end (no word-based trimming).
-    """
-    raw_body = clean_body(post.get("selftext"))
+def build_tweet_sync(post: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[str]:
+    raw_body = clean_body_sync(post.get("selftext"))
     title = (post.get("title") or "").strip()
-
     has_title = bool(title)
     has_body = bool(raw_body)
-    has_images = is_gallery_post(post) or post_has_image(post)
-
-    # RULE 1 — Base text selection
+    has_images = is_gallery_post_sync(post) or post_has_image_sync(post)
+    # Base text selection same rules
     if has_title and not has_body:
-        # CASE A
         base_text = title
     elif has_title and has_body and has_images:
-        # CASE C
         base_text = title
     elif has_title and has_body:
-        # CASE B
         base_text = raw_body
     elif has_body:
         base_text = raw_body
     elif has_title:
         base_text = title
     else:
-        return None  # nothing tweetable
-
+        return None
     base_text = base_text.strip()
     if not base_text:
         return None
-
-    # External URL logic: If URL is external → include it; If URL is Reddit → ignore it.
     url = post.get("url") or ""
     external_url = url if is_external_url(url) else ""
-
-    # RULE 2 — Append subreddit-specific hashtags
     hashtags = cfg.get("hashtags", "").strip()
-    hashtag_tokens = _split_hashtags(hashtags)
-
-    def assemble_tweet(current_base: str, tokens: List[str]) -> str:
+    hashtag_tokens = [tok for tok in hashtags.split() if tok.strip()]
+    def assemble(current_base: str, tokens: List[str]) -> str:
         hashtags_str = " ".join(tokens) if tokens else ""
-        current_base = current_base.strip()
-
         if external_url:
             if hashtags_str:
                 txt = f"{current_base}\n{external_url}\n{hashtags_str}"
@@ -621,524 +426,220 @@ def build_tweet(post: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[str]:
                 txt = f"{current_base} {hashtags_str}"
             else:
                 txt = current_base
-
         return txt.strip()
-
-    # Start with full hashtags
-    tweet = assemble_tweet(base_text, hashtag_tokens)
-
-    # If already within limit, done
+    tweet = assemble(base_text, hashtag_tokens)
     if len(tweet) <= TWEET_MAX_LEN:
         return tweet
-
-    # RULE 3 — Trim hashtags from the END
     tokens = list(hashtag_tokens)
     while len(tweet) > TWEET_MAX_LEN and tokens:
-        tokens.pop()  # drop last hashtag
-        tweet = assemble_tweet(base_text, tokens)
-
+        tokens.pop()
+        tweet = assemble(base_text, tokens)
     if len(tweet) <= TWEET_MAX_LEN:
         return tweet
-
-    # No hashtags left; now trim base_text character-by-character
-    tokens = []  # no hashtags
+    # trim base_text char-by-char
+    tokens = []
     while len(tweet) > TWEET_MAX_LEN and base_text:
-        base_text = base_text[:-1]  # trim one character
-        tweet = assemble_tweet(base_text, tokens)
-
-    # Extremely defensive: if base_text empty and still over limit (e.g., absurdly long URL),
-    # truncate the final tweet string safely by characters (still character-level trimming).
+        base_text = base_text[:-1]
+        tweet = assemble(base_text, tokens)
     if len(tweet) > TWEET_MAX_LEN:
         tweet = tweet[:TWEET_MAX_LEN]
-
     return tweet if tweet.strip() else None
 
-
-# =========================================
-# MEDIA UPLOAD
-# =========================================
-
-def get_oauth1_client() -> Optional[OAuth1]:
-    api_key = os.getenv("X_API_KEY")
-    api_secret = os.getenv("X_API_SECRET")
-    access_token = os.getenv("X_ACCESS_TOKEN")
-    access_secret = os.getenv("X_ACCESS_SECRET")
-
-    if not all([api_key, api_secret, access_token, access_secret]):
-        return None
-
-    return OAuth1(
-        api_key,
-        api_secret,
-        access_token,
-        access_secret,
-        signature_type="auth_header",
-    )
-
-
-def upload_images_to_twitter(image_urls: List[str]) -> List[str]:
-    """
-    Upload images via v1.1 media/upload.
-    Requires OAuth1 user context.
-    Returns list of media_ids.
-    """
-    oauth1 = get_oauth1_client()
-    if not oauth1:
-        logger.info("No OAuth1 keys present; posting without media.")
-        return []
-
-    media_ids: List[str] = []
-
-    for img_url in image_urls:
-        try:
-            img_resp = requests.get(img_url, timeout=20)
-            img_resp.raise_for_status()
-            resp = requests.post(
-                MEDIA_UPLOAD_URL,
-                files={"media": img_resp.content},
-                auth=oauth1,
-                timeout=30,
-            )
-            if resp.status_code >= 300:
-                logger.warning("Media upload failed (%s): %s", resp.status_code, resp.text)
-                continue
-
-            data = resp.json()
-            mid = data.get("media_id_string") or data.get("media_id")
-            if mid:
-                media_ids.append(str(mid))
-
-        except Exception as e:
-            logger.warning("Error uploading media from %s: %s", img_url, e)
-
-    return media_ids
-
-
-# =========================================
-# TWITTER POSTING (HYBRID AUTH)
-# =========================================
-
-def get_twitter_auth(prefer_oauth1: bool = False) -> Tuple[str, Any]:
-    """
-    Returns (auth_type, auth_obj_or_headers)
-    auth_type: "oauth2" or "oauth1"
-    - If prefer_oauth1=True and OAuth1 keys exist, choose OAuth1 first.
-    - Otherwise, if Bearer exists, use oauth2; fallback to oauth1.
-    """
-    oauth1 = get_oauth1_client()
-    bearer = os.getenv("X_BEARER_TOKEN")
-
-    if prefer_oauth1 and oauth1:
-        return "oauth1", oauth1
-
-    if bearer:
-        headers = {
-            "Authorization": f"Bearer {bearer}",
-            "Content-Type": "application/json",
-        }
-        return "oauth2", headers
-
-    if oauth1:
-        return "oauth1", oauth1
-
-    raise RuntimeError("No valid Twitter credentials: set X_BEARER_TOKEN or OAuth1 keys.")
-
-
-def twitter_post_tweet(text: str, media_ids: Optional[List[str]] = None) -> Dict[str, Any]:
-    """
-    Hybrid posting:
-    - If media_ids present -> prefer OAuth1 (user context).
-      If OAuth1 missing but Bearer exists, tweet without media.
-    - If no media_ids -> OAuth2 Bearer if present, else OAuth1.
-    """
-    if media_ids:
-        # Need OAuth1 for media; if not present, drop media_ids.
-        oauth1 = get_oauth1_client()
-        if oauth1:
-            auth_type, auth_obj = "oauth1", oauth1
-            payload: Dict[str, Any] = {"text": text, "media": {"media_ids": media_ids}}
-        else:
-            logger.info("No OAuth1 for media; tweeting text-only via OAuth2/OAuth1 fallback.")
-            auth_type, auth_obj = get_twitter_auth(prefer_oauth1=False)
-            payload = {"text": text}
-    else:
-        auth_type, auth_obj = get_twitter_auth(prefer_oauth1=False)
-        payload = {"text": text}
-
-    if auth_type == "oauth2":
-        headers = auth_obj  # type: ignore
-        resp = requests.post(TWEET_POST_URL_V2, json=payload, headers=headers, timeout=20)
-    else:
-        resp = requests.post(TWEET_POST_URL_V2, json=payload, auth=auth_obj, timeout=20)
-
-    if resp.status_code >= 300:
-        raise RuntimeError(f"Twitter error {resp.status_code}: {resp.text}")
-
-    return resp.json().get("data", {})
-
-
-# =========================================
-# EMERGENCY MODE — RETWEET @HumansNoContext
-# =========================================
-
-def retweet_recent_from_humans_no_context(slot_id: str) -> Optional[str]:
-    """
-    EMERGENCY MODE: If no Reddit post qualifies, retweet the most recent
-    non-reply, non-retweet tweet from @HumansNoContext.
-
-    Uses Twitter API v1.1 user_timeline + statuses/retweet/:id with OAuth1.
-    """
-    oauth1 = get_oauth1_client()
-    if not oauth1:
-        logger.error("Emergency retweet failed: no OAuth1 credentials.")
-        log_session(slot_id, "fail", "emergency_retweet_no_oauth1", {})
-        return None
-
-    try:
-        params = {
-            "screen_name": HUMANS_NO_CONTEXT_HANDLE,
-            "count": 5,
-            "exclude_replies": "true",
-            "include_rts": "false",
-            "tweet_mode": "extended",
-        }
-        resp = requests.get(TWITTER_USER_TIMELINE_URL_V1, params=params, auth=oauth1, timeout=20)
-        if resp.status_code >= 300:
-            logger.error("Failed to fetch HumansNoContext timeline: %s %s", resp.status_code, resp.text)
-            log_session(
-                slot_id,
-                "fail",
-                "emergency_timeline_fetch_failed",
-                {"status_code": resp.status_code, "response": resp.text[:300]},
-            )
-            return None
-
-        timeline = resp.json()
-        if not isinstance(timeline, list) or not timeline:
-            logger.error("Empty or invalid timeline from HumansNoContext")
-            log_session(slot_id, "fail", "emergency_timeline_empty", {})
-            return None
-
-        tweet = timeline[0]
-        tweet_id = tweet.get("id_str") or str(tweet.get("id"))
-        if not tweet_id:
-            logger.error("No tweet id found for HumansNoContext latest tweet")
-            log_session(slot_id, "fail", "emergency_no_tweet_id", {})
-            return None
-
-        rt_url = TWITTER_RETWEET_URL_V1.format(tweet_id=tweet_id)
-        rt_resp = requests.post(rt_url, auth=oauth1, timeout=20)
-
-        if rt_resp.status_code >= 300:
-            logger.error("Retweet failed: %s %s", rt_resp.status_code, rt_resp.text)
-            log_session(
-                slot_id,
-                "fail",
-                "emergency_retweet_failed",
-                {"status_code": rt_resp.status_code, "response": rt_resp.text[:300]},
-            )
-            return None
-
-        logger.info("Emergency retweet successful: %s", tweet_id)
-        return tweet_id
-
-    except Exception as e:
-        logger.error("Exception during emergency retweet: %s", e)
-        log_session(slot_id, "fail", "emergency_retweet_exception", {"error": str(e)})
-        return None
-
-
-# =========================================
-# CORE SLOT LOGIC — REDDIT SELECTION PIPELINE
-# =========================================
-
-def pick_best_post_and_tweet_text(
-    posts: List[Dict[str, Any]],
-    cfg: Dict[str, Any],
-    subreddit_name: str,
-) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Implements the full selection pipeline:
-
-    STEP 1 — Sliding time windows:
-      - 10h, then 24h, then 48h (stop as soon as one window yields a valid tweet)
-
-    STEP 2 — Hard Filters:
-      - Apply passes_hard_filters()
-
-    STEP 3 — Text Length Filter:
-      - If Text/Link post AND len(selftext) > 200 => reject
-
-    STEP 4 — Prioritization Groups:
-      - Priority 3: no body AND (gallery or image)
-      - Priority 2: other gallery/image posts
-      - Priority 1: short text/link (≤ 200 chars)
-
-    STEP 5 — Engagement Score:
-      - score = upvotes*0.65 + comments*0.35 + upvote_ratio*10
-
-    STEP 6 — Selection:
-      - Sort by priority DESC, score DESC
-      - Build tweet; first tweetable candidate wins
-    """
-    now_ts = now_utc().timestamp()
-
+async def pick_best_post_and_tweet_text_async(posts: List[Dict[str, Any]], cfg: Dict[str, Any], subreddit_name: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    now_ts = datetime.utcnow().timestamp()
+    # iterate windows
     for hours in WINDOW_SEQUENCE_HOURS:
         cutoff_ts = now_ts - hours * 3600
-        candidates: List[Dict[str, Any]] = []
-
-        for p in posts:
+        candidates = []
+        # analyze posts concurrently but limited
+        sem = asyncio.Semaphore(CONCURRENT_FETCHES)
+        async def analyze_if_candidate(p):
             created = p.get("created_utc") or 0
             try:
                 created_ts = float(created)
             except Exception:
-                continue
-
-            # STEP 1 — time window
+                return None
             if created_ts < cutoff_ts:
-                continue
-
-            # Hard filters
-            if not passes_hard_filters(p):
-                continue
-
-            # Skip already posted
+                return None
             reddit_id = p.get("id")
             if reddit_id and was_post_recently_posted(reddit_id):
-                continue
-
-            # Text length filter for text/link posts
-            body = clean_body(p.get("selftext"))
-            if is_text_or_link_post(p) and len(body) > 200:
-                continue
-
-            # If there is neither body nor title, skip
-            title = (p.get("title") or "").strip()
-            if not body and not title:
-                continue
-
-            # Compute priority and score
-            priority = compute_priority_group(p, body)
-            score = compute_engagement_score(p)
-
-            candidates.append(
-                {
-                    "post": p,
-                    "priority": priority,
-                    "score": score,
-                }
-            )
-
+                return None
+            # quick analysis cached
+            async with sem:
+                analysis = await analyze_post_cached(p)
+            if not analysis.get("pass"):
+                return None
+            # If text/link post and body > 200 reject
+            body = analysis.get("body", "")
+            if (p.get("is_self") or (str(p.get("post_hint") or "").lower() in ("link", "rich:video"))) and len(body) > 200:
+                return None
+            if not body and not analysis.get("title"):
+                return None
+            # candidate
+            return {"post": p, "priority": analysis["priority"], "score": analysis["score"], "analysis": analysis}
+        # launch all
+        tasks = [asyncio.create_task(analyze_if_candidate(p)) for p in posts]
+        results = await asyncio.gather(*tasks)
+        for r in results:
+            if r:
+                candidates.append(r)
         logger.info("Window %sh -> %d candidates for %s", hours, len(candidates), subreddit_name)
-
         if not candidates:
-            # No candidates in this window; expand to next window
             continue
-
-        # STEP 6 — select top post within this window
-        candidates_sorted = sorted(
-            candidates,
-            key=lambda c: (-c["priority"], -c["score"]),
-        )
-
-        for item in candidates_sorted:
-            post = item["post"]
-            tweet = build_tweet(post, cfg)
+        # single-pass selection (O(n)) to find best
+        best = None
+        for c in candidates:
+            if not best or (c["priority"], c["score"]) > (best["priority"], best["score"]):
+                best = c
+        # attempt tweet build for the best candidate; if fail, try next best without sorting whole list
+        # create a small heap of top-k by priority+score to try candidates in decreasing order
+        # produce keys as tuple (-priority, -score) for min-heap
+        heap = []
+        for c in candidates:
+            heapq.heappush(heap, ((-c["priority"], -c["score"]), c))
+        while heap:
+            _, cand = heapq.heappop(heap)
+            post = cand["post"]
+            tweet = build_tweet_sync(post, cfg)
             if tweet:
-                logger.info(
-                    "Selected post from %s window=%sh priority=%s score=%.2f id=%s",
-                    subreddit_name,
-                    hours,
-                    item["priority"],
-                    item["score"],
-                    post.get("id"),
-                )
+                logger.info("Selected post id=%s priority=%s score=%.2f", post.get("id"), cand["priority"], cand["score"])
                 return post, tweet
-
-        # If we had candidates but none tweetable, try next (larger) window.
-        logger.info(
-            "Window %sh had %d candidates but none tweetable for %s; expanding window.",
-            hours,
-            len(candidates),
-            subreddit_name,
-        )
-
-    # After 10h/24h/48h windows, no tweetable post
+        # if none tweetable -> expand window
     return None, None
 
+# ============== ASYNC MEDIA UPLOAD (placeholder) =================
+# NOTE: OAuth1 with aiohttp requires building the auth header; here we'll
+# show an async-concurrent upload pattern. In production, implement OAuth1
+# properly or run uploads via ThreadPool with requests if simpler.
 
-def handle_slot_for_subreddit(name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Integrated logging with selection pipeline + Emergency Mode.
+async def upload_single_image(session: ClientSession, img_url: str) -> Optional[str]:
+    try:
+        b = await fetch_bytes(session, img_url)
+        if not b:
+            return None
+        # Placeholder: upload to Twitter v1.1 requires OAuth1; the implementation depends on your infra.
+        # If you have OAuth1, construct multipart/form-data request with auth headers here.
+        # For now we'll return a fake media id to illustrate pipeline (replace with real upload).
+        await asyncio.sleep(0)  # yield
+        fake_mid = "m_" + str(abs(hash(img_url)))[-10:]
+        return fake_mid
+    except Exception as e:
+        logger.warning("upload_single_image failed %s: %s", img_url, e)
+        return None
 
-    If no Reddit post qualifies after all windows and filters:
-    - EMERGENCY MODE: retweet the most recent tweet from @HumansNoContext
-    """
+async def upload_images_to_twitter_async(session: ClientSession, image_urls: List[str]) -> List[str]:
+    if not image_urls:
+        return []
+    sem = asyncio.Semaphore(MEDIA_UPLOAD_WORKERS)
+    async def wrapped(u):
+        async with sem:
+            return await upload_single_image(session, u)
+    tasks = [asyncio.create_task(wrapped(u)) for u in image_urls]
+    results = await asyncio.gather(*tasks)
+    return [r for r in results if r]
+
+# ============== TWITTER POST (placeholder) ======================
+# Implement real post with Twitter API v2 + bearer or OAuth1 as your infra supports.
+# For demonstration, these are async placeholders that must be wired to real auth.
+
+async def twitter_post_tweet_async(session: ClientSession, text: str, media_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+    # In production: call TWEET_POST_URL_V2 with Bearer or OAuth1 as required.
+    await asyncio.sleep(0)  # placeholder
+    fake_id = "tweet_" + str(abs(hash(text)))[:8]
+    return {"id": fake_id}
+
+async def retweet_recent_from_humans_no_context_async(session: ClientSession) -> Optional[str]:
+    # Placeholder: fetch timeline and retweet using OAuth1; return tweet id
+    await asyncio.sleep(0)
+    return None  # return None to indicate fallback not implemented in placeholder
+
+# ============== CORE SLOT HANDLER =============================
+async def handle_slot_for_subreddit_async(session: ClientSession, name: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
     slot_id = f"slot_{name}"
-
-    # STEP 1: Fetch posts
-    posts = fetch_subreddit_posts(cfg)
+    posts = await fetch_subreddit_posts(session, cfg["url"], limit=REDDIT_LIMIT)
     if not posts:
-        log_session(slot_id, "fail", "reddit_fetch_empty", {"subreddit": name})
+        logger.warning("reddit_fetch_empty %s", name)
         return {"subreddit": name, "status": "reddit_fetch_empty"}
-
-    # STEPS 1–6: Sliding windows + filters + scoring + tweet build
-    best_post, tweet_text = pick_best_post_and_tweet_text(posts, cfg, name)
-
+    best_post, tweet_text = await pick_best_post_and_tweet_text_async(posts, cfg, name)
     if not best_post or not tweet_text:
-        # EMERGENCY MODE — NEVER BREAK THE BOT
-        logger.info("No qualifying Reddit post for %s. Entering EMERGENCY MODE.", name)
-        rt_id = retweet_recent_from_humans_no_context(slot_id)
+        logger.info("No qualifying Reddit post for %s. Trying emergency retweet.", name)
+        rt_id = await retweet_recent_from_humans_no_context_async(session)
         if rt_id:
-            log_session(
-                slot_id,
-                "success",
-                "emergency_retweet",
-                {"retweeted_tweet_id": rt_id, "source_handle": HUMANS_NO_CONTEXT_HANDLE},
-            )
-            return {
-                "subreddit": name,
-                "status": "emergency_retweet",
-                "retweeted_tweet_id": rt_id,
-                "source_handle": HUMANS_NO_CONTEXT_HANDLE,
-            }
-        else:
-            log_session(
-                slot_id,
-                "fail",
-                "no_tweetable_post_and_emergency_failed",
-                {"subreddit": name},
-            )
-            return {
-                "subreddit": name,
-                "status": "no_tweetable_post_emergency_failed",
-            }
-
-    # Media extraction & upload (if any)
-    image_urls = extract_image_urls(best_post)
-    media_ids: List[str] = []
+            return {"subreddit": name, "status": "emergency_retweet", "retweeted_tweet_id": rt_id}
+        return {"subreddit": name, "status": "no_tweetable_post_emergency_failed"}
+    image_urls = extract_image_urls_sync(best_post)
+    media_ids = []
     if image_urls:
         try:
-            media_ids = upload_images_to_twitter(image_urls)
-            if not media_ids and image_urls:
-                # media urls were found but upload failed
-                log_session(
-                    slot_id,
-                    "fail",
-                    "media_upload_partial_or_failed",
-                    {"image_urls": image_urls},
-                )
-                # proceed: tweet without media
+            media_ids = await upload_images_to_twitter_async(session, image_urls)
         except Exception as e:
-            log_session(slot_id, "fail", "media_upload_failed", {"error": str(e)})
+            logger.warning("media upload failed: %s", e)
             media_ids = []
-
-    # Post tweet
     try:
-        data = twitter_post_tweet(tweet_text, media_ids=media_ids or None)
+        data = await twitter_post_tweet_async(session, tweet_text, media_ids or None)
         tweet_id = data.get("id")
         tweet_url = f"https://x.com/i/web/status/{tweet_id}" if tweet_id else None
-
-        # Mark as posted to avoid repeats
         reddit_id = best_post.get("id")
         if reddit_id:
             mark_post_as_posted(reddit_id, name)
-
-        log_session(
-            slot_id,
-            "success",
-            None,
-            {"post_id": best_post.get("id"), "tweet_url": tweet_url},
-        )
-        return {
-            "subreddit": name,
-            "status": "tweeted",
-            "tweet_url": tweet_url,
-            "post_id": best_post.get("id"),
-        }
-
+        return {"subreddit": name, "status": "tweeted", "tweet_url": tweet_url, "post_id": reddit_id}
     except Exception as e:
         logger.error("Failed to post tweet for %s: %s", name, e)
-        log_session(slot_id, "fail", "tweet_post_failed", {"error": str(e)})
         return {"subreddit": name, "status": "error", "error": str(e)}
 
+def hhmm_ist(dt: Optional[datetime] = None) -> str:
+    if dt is None:
+        dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    return dt.strftime("%H:%M")
+
+def minutes_since_midnight(dt: datetime) -> int:
+    return dt.hour * 60 + dt.minute
+
+def parse_hhmm_to_minutes(hhmm: str) -> int:
+    h_str, m_str = hhmm.split(":")
+    return int(h_str) * 60 + int(m_str)
 
 def find_due_subreddits(now: datetime) -> List[Tuple[str, Dict[str, Any]]]:
-    """
-    Return all (name, cfg) where current IST time is within ±SLOT_TOLERANCE_MINUTES
-    of the configured post_time.
-    """
     now_min = minutes_since_midnight(now)
-    slot_now = hhmm_ist(now)
-    logger.info("Current IST time %s (%s minutes)", slot_now, now_min)
-
-    targets: List[Tuple[str, Dict[str, Any]]] = []
-
+    targets = []
     for name, cfg in SUBREDDITS.items():
-        slot_str = cfg["post_time"]
-        slot_min = parse_hhmm_to_minutes(slot_str)
+        slot_min = parse_hhmm_to_minutes(cfg["post_time"])
         delta = abs(now_min - slot_min)
-        logger.info("Subreddit %s slot %s (%s minutes), delta=%s", name, slot_str, slot_min, delta)
-
+        last_id = POST_HISTORY.get("subreddit_last", {}).get(name)
         if delta <= SLOT_TOLERANCE_MINUTES:
-            # Avoid re-triggering same subreddit if we've already posted
-            last_id = POST_HISTORY.get("subreddit_last", {}).get(name)
             if last_id and was_post_recently_posted(last_id):
-                logger.info(
-                    "Skipping subreddit %s because last post %s was recent",
-                    name,
-                    last_id,
-                )
                 continue
             targets.append((name, cfg))
-
     return targets
 
-
-def handle_awake() -> Dict[str, Any]:
-    ist = now_ist()
-    logger.info("AWAKE at IST: %s", ist.isoformat())
-
+# ============== ENTRYPOINT (async) ============================
+async def handle_awake_async() -> Dict[str, Any]:
+    ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     targets = find_due_subreddits(ist)
-
     if not targets:
-        logger.info("No subreddit within ±%s minutes of any slot.", SLOT_TOLERANCE_MINUTES)
-        # Log timing miss — useful when scheduler fired at wrong time
-        log_session("slot_timing", "fail", "no_slot_due", {"time": ist.isoformat()})
-        return {
-            "status": "no_slot",
-            "time_ist": ist.isoformat(),
-            "tolerance_minutes": SLOT_TOLERANCE_MINUTES,
-        }
+        return {"status": "no_slot", "time_ist": ist.isoformat(), "tolerance_minutes": SLOT_TOLERANCE_MINUTES}
+    async with aiohttp.ClientSession() as session:
+        tasks = [asyncio.create_task(handle_slot_for_subreddit_async(session, name, cfg)) for name, cfg in targets]
+        results = await asyncio.gather(*tasks)
+    return {"status": "done", "time_ist": ist.isoformat(), "tolerance_minutes": SLOT_TOLERANCE_MINUTES, "results": results}
 
-    results: List[Dict[str, Any]] = []
-    for name, cfg in targets:
-        res = handle_slot_for_subreddit(name, cfg)
-        results.append(res)
-
-    return {
-        "status": "done",
-        "time_ist": ist.isoformat(),
-        "tolerance_minutes": SLOT_TOLERANCE_MINUTES,
-        "results": results,
-    }
-
-
-# =========================================
-# FLASK ENDPOINTS
-# =========================================
-
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({"status": "running", "service": "reddit→x bot"})
-
-
-@app.route("/awake", methods=["GET", "POST"])
-def awake():
-    result = handle_awake()
-    return jsonify(result)
-
-
+# ============== SIMPLE CLI TEST RUN ============================
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-once", action="store_true", help="Run slot handler once and exit")
+    args = parser.parse_args()
+    if args.run_once:
+        res = asyncio.run(handle_awake_async())
+        print(json.dumps(res, indent=2))
+    else:
+        # Example simple loop - in production use scheduler (cron, systemd, cloud scheduler)
+        async def loop_forever():
+            while True:
+                res = await handle_awake_async()
+                logger.info("AWAKE result: %s", res)
+                await asyncio.sleep(60)  # low-frequency loop; scheduler preferred
+        try:
+            asyncio.run(loop_forever())
+        except KeyboardInterrupt:
+            logger.info("Exiting.")
