@@ -1,0 +1,18 @@
+name: Wake Render Before Post
+
+on:
+  schedule:
+    # Wake 10 mins before each slot (UTC times)
+    - cron: "20 0 * * *"   # 05:50 IST → for 06:00 post
+    - cron: "20 3 * * *"   # 08:50 IST → for 09:00 post
+    - cron: "20 6 * * *"   # 11:50 IST → for 12:00 post
+    - cron: "20 9 * * *"   # 14:50 IST → for 15:00 post
+    - cron: "20 12 * * *"  # 17:50 IST → for 18:00 post
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake Render App
+        run: |
+          curl -s "https://reddit-tech-to-x-bot.onrender.com/"
