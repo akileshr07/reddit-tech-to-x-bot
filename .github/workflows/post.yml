@@ -1,0 +1,18 @@
+name: Trigger Bot Posting
+
+on:
+  schedule:
+    # Posting at exact slot times (UTC)
+    - cron: "30 0 * * *"   # 06:00 IST
+    - cron: "30 3 * * *"   # 09:00 IST
+    - cron: "30 6 * * *"   # 12:00 IST
+    - cron: "30 9 * * *"   # 15:00 IST
+    - cron: "30 12 * * *"  # 18:00 IST
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Bot /awake
+        run: |
+          curl -s -X GET "https://reddit-tech-to-x-bot.onrender.com/awake"
