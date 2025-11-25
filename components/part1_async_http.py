@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 #!/usr/bin/env python3
 """
 part1_async_http.py
@@ -12,7 +14,6 @@ Provides:
   - run_sync(coro)  # safe helper to run async from sync (Flask)
 """
 
-from __future__ import annotations
 
 import asyncio
 import logging
