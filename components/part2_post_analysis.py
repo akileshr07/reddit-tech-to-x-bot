@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 part2_post_analysis.py
 
@@ -14,7 +15,6 @@ Exports:
   - analyze_post_async(post)
 """
 
-from __future__ import annotations
 
 import re
 import logging
