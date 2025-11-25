@@ -1,12 +1,16 @@
 services:
   - type: web
-    name: reddit-tech-to-x-bot
+    name: reddit-x-bot
     env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn bot:app --bind 0.0.0.0:$PORT
-    autoDeploy: true
+    region: singapore            # choose closest region to India for low-latency
+    plan: starter                # free → change to starter/pro as needed
+    buildCommand: |
+      pip install -r requirements.txt
+    startCommand: |
+      gunicorn bot:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 180
+
     envVars:
+      # Required Twitter API Keys
       - key: X_API_KEY
         sync: false
       - key: X_API_SECRET
@@ -17,3 +21,16 @@ services:
         sync: false
       - key: X_BEARER_TOKEN
         sync: false
+
+      # Optional Logging Path (Defaults to session_log.jsonl)
+      - key: SESSION_LOG_FILE
+        value: session_log.jsonl
+
+      # Flask must listen on this port
+      - key: PORT
+        value: 5000
+
+    autoDeploy: true
+    healthCheckPath: /
+    domains:
+      - reddit-x-bot.onrender.com  # optional custom domain
