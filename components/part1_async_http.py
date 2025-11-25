@@ -1,6 +1,5 @@
-from __future__ import annotations
-
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 part1_async_http.py
 
