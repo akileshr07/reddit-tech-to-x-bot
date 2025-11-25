@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 part3_media_pipeline.py
 
@@ -10,7 +12,6 @@ Integrates with:
   - Uses aiohttp for async downloads, requests + ThreadPoolExecutor for safe uploads
 """
 
-from __future__ import annotations
 
 import asyncio
 import async_timeout
