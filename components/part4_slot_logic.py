@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Part 4 — Slot Logic (Async)
 This file orchestrates:
@@ -10,7 +12,6 @@ This file orchestrates:
   - Logging & history
 """
 
-from __future__ import annotations
 
 import os
 import time
